@@ -178,6 +178,7 @@ class BreakableCapture:
     ) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
+        self._graphs: list[torch.cuda.CUDAGraph] = []
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing = False
         if stream is None:
@@ -243,11 +244,30 @@ class BreakableCapture:
         assert self._current_graph is not None
         self._current_graph.capture_end()
         self.segments.append(self._current_graph.replay)
+        self._graphs.append(self._current_graph)
         # All segments share one pool so intermediate addresses stay stable.
         if self.pool is None:
             self.pool = self._current_graph.pool()
         self._current_graph = None
         self._capturing = False
+
+    def close(self) -> None:
+        """Reset captured segments and release graph-owned references.
+
+        The caller must stop replays and synchronize the device first. Graph
+        executables can retain collective nodes, so close them before their
+        process groups. Successful repeated calls are harmless; a reset
+        failure propagates and must prevent distributed teardown.
+        """
+        if self._capturing or BreakableCapture.current() is not None:
+            raise RuntimeError("cannot close a BreakableCapture during capture")
+        for graph in reversed(self._graphs):
+            graph.reset()
+        self._graphs.clear()
+        self.segments.clear()
+        self._handoff.clear()
+        self._current_graph = None
+        self.pool = None
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
         """End the current segment, run ``fn`` eagerly, record it, start a new one.

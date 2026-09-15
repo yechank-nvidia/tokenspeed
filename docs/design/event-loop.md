@@ -106,6 +106,27 @@ broadcasts on the same issuing thread as the model's collectives, restoring
 the cross-rank launch-order guarantee the old non-overlap-loop assumption
 provided.
 
+### Explicit device teardown
+
+`DeviceHandle.close()` is the named operation for releasing the running
+device side. Its caller must first stop submissions, commit pending forwards
+and quiesce external transfers. A terminal closure follows the already queued
+work on the forward thread: settle L2 transfers, synchronize the device,
+close prefill captures, then close decode captures. Unpolled submission errors
+are surfaced, and the forward thread is joined even if graph release raises.
+A failed close remains an error on subsequent calls; a successful close is
+idempotent.
+
+`ForwardThread.shutdown()` rejects new submissions before putting its stop
+item into the FIFO. A submission racing with shutdown is either queued before
+that item or rejected, so no future is left behind an exited worker. A worker
+that does not join within 30 seconds raises an error.
+
+The caller owns cross-rank stop agreement and the overall shutdown deadline.
+Every participating rank must complete device teardown before its process
+groups can be destroyed. These resource-release APIs provide that local step;
+the distributed shutdown coordinator supplies the ordering between ranks.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,

@@ -301,6 +301,29 @@ class ForwardStepRunner:
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
 
+    def close(self) -> None:
+        """Release decode graphs before their captured process groups.
+
+        Run on the device-owning thread after submissions have stopped and
+        prefill captures sharing the pool have closed. Synchronization fences
+        prior launches before reset and device resource release afterwards.
+        Repeated successful calls do not reset a graph twice. Reset failures
+        propagate so the owner can fail shutdown instead of destroying groups
+        while graph executables remain live.
+        """
+        global global_graph_memory_pool
+
+        self.device_module.synchronize()
+        for graph in reversed(tuple(self.graphs.values())):
+            reset = getattr(graph, "reset", None)
+            if callable(reset):
+                reset()
+        self.graphs.clear()
+        self.output_buffers.clear()
+        self._metadata_snapshots.clear()
+        global_graph_memory_pool = None
+        self.device_module.synchronize()
+
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------

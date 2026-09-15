@@ -258,6 +258,56 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
+        self._closed = False
+        self._close_error: BaseException | None = None
+
+    def close(self) -> None:
+        """Release graph resources on the data plane, then join its thread.
+
+        Call only after the control plane stops submitting work, commits all
+        pending forwards and quiesces external transfers. This final closure
+        follows every queued submission, settles L2 transfers, synchronizes
+        the device, and releases prefill graphs before decode graphs. Process
+        groups must remain live until this method succeeds on every rank.
+
+        Success is idempotent. A failed close stops the forward thread and
+        remains an error on repeated calls; it cannot be mistaken for a
+        successful device shutdown.
+        """
+        if self._closed:
+            if self._close_error is not None:
+                raise RuntimeError(
+                    "device shutdown previously failed"
+                ) from self._close_error
+            return
+        executor = self._executor
+        l2 = self._l2
+
+        def close_runtime() -> None:
+            if l2 is not None:
+                l2.shutdown()
+            executor.device_module.synchronize()
+            executor.prefill_graph.close()
+            executor.forward_step.close()
+
+        try:
+            self._thread.run(close_runtime)
+            # The FIFO has settled every prior submission, including ones
+            # whose exception a final scheduling round has not polled yet.
+            for submissions in (self._l2_submissions, self._transfer_submissions):
+                while submissions:
+                    submissions.popleft().result()
+        except BaseException as exc:
+            self._close_error = exc
+            raise
+        finally:
+            self._closed = True
+            try:
+                self._thread.shutdown()
+            except BaseException as exc:
+                if self._close_error is None:
+                    self._close_error = exc
+                raise
 
     # ------------------------------------------------------------------
     # Per-round work

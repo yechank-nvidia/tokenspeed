@@ -149,6 +149,8 @@ class ForwardThread:
                 else device_module.current_device()
             )
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._submission_lock = threading.Lock()
+        self._shutdown_requested = False
         self._thread = threading.Thread(
             target=self._run, name="tokenspeed::forward", daemon=True
         )
@@ -183,7 +185,10 @@ class ForwardThread:
             A future resolved with ``fn``'s return value, or its exception.
         """
         future: Future = Future()
-        self._queue.put((fn, future))
+        with self._submission_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("forward thread is shut down")
+            self._queue.put((fn, future))
         return future
 
     def run(self, fn: Callable[[], Any]) -> Any:
@@ -203,5 +208,16 @@ class ForwardThread:
         return self.submit(fn).result()
 
     def shutdown(self) -> None:
-        self._queue.put(None)
+        """Reject new submissions, finish the FIFO and join the worker.
+
+        Concurrent submissions are either before the terminal queue item or
+        rejected. Repeated calls join the same shutdown and never enqueue work
+        behind a worker that has exited. A join timeout is an explicit error.
+        """
+        with self._submission_lock:
+            if not self._shutdown_requested:
+                self._shutdown_requested = True
+                self._queue.put(None)
         self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            raise RuntimeError("forward thread did not stop within 30 seconds")

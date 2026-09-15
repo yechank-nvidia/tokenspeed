@@ -345,6 +345,21 @@ class PrefillGraph:
                 sample.num_segments if sample is not None else 0,
             )
 
+    def close(self) -> None:
+        """Release captured prefill graphs and their retained outputs.
+
+        The caller stops replays and synchronizes the device before closing.
+        Reset failures propagate without discarding the remaining owners.
+        Close prefill captures before decode captures sharing their pool.
+        """
+        for capture in reversed(tuple(self._captures.values())):
+            capture.close()
+        self._captures.clear()
+        self._outputs.clear()
+        self._ctx = None
+        self._input_embeds_buf = None
+        self._pool = None
+
     def _capture_bucket(
         self, bucket: int, decode_wrapper: ForwardStepRunner | None
     ) -> None:
