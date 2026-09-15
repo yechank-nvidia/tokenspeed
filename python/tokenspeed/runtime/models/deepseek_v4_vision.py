@@ -100,6 +100,10 @@ class DeepseekV4VisionRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            from tokenspeed_kernel.ops.vision_rmsnorm import apply_vision_rmsnorm
+
+            return apply_vision_rmsnorm(x, self.weight, self.eps)
         dtype = x.dtype
         normalized = x.float()
         normalized = normalized * torch.rsqrt(
