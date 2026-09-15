@@ -39,7 +39,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "triton_rowcta_gemv"]
+__all__ = ["decode_gemv", "triton_fp32_decode_gemv", "triton_rowcta_gemv"]
 
 
 @triton.jit
@@ -355,5 +355,111 @@ def grouped_bf16_projection_rowcta(
         OUT_GROUP_STRIDE=out.stride(1),
         num_warps=4,
         enable_fp_fusion=False,
+    )
+    return out
+
+
+@triton.jit
+def _fp32_decode_gemv_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """One FP32 weight row per CTA for bandwidth-bound decode projection."""
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_K)
+    mask = offsets < K
+
+    weight = tl.load(
+        weight_ptr + row * K + offsets,
+        mask=mask,
+        other=0.0,
+    )
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + row, tl.sum(x * weight))
+
+
+@register_kernel(
+    "gemm",
+    "fp32_decode_gemv",
+    name="triton_fp32_decode_gemv",
+    solution="triton",
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.float32),
+                weight=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={"m": frozenset({1})},
+    priority=Priority.SPECIALIZED,
+)
+def triton_fp32_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute an FP32 ``x @ weight.T`` for a single decode row.
+
+    The kernel assigns one contiguous weight row to each CTA and performs a
+    fixed-order FP32 reduction. It is intended for memory-bound, large-output
+    projections. Multi-row inputs remain GEMM
+    workloads and should use :func:`torch.mm` instead.
+
+    Args:
+        x: Contiguous FP32 activation shaped ``[1, K]``, with ``1 <= K <= 65536``.
+        weight: Contiguous FP32 weight shaped ``[N, K]``.
+        out: Contiguous FP32 destination shaped ``[1, N]``, or ``None`` to
+            allocate one. Nonempty destinations must not share input storage.
+
+    Returns:
+        The FP32 output shaped ``[1, N]``.
+    """
+    if x.dim() != 2 or weight.dim() != 2:
+        raise ValueError("x and weight must be rank-2 tensors")
+    if x.shape[0] != 1 or x.shape[1] != weight.shape[1]:
+        raise ValueError(
+            "fp32_decode_gemv requires x shaped [1, K] and weight shaped [N, K]"
+        )
+    if x.dtype != torch.float32 or weight.dtype != torch.float32:
+        raise TypeError("fp32_decode_gemv requires FP32 x and weight")
+    if x.device != weight.device or not x.is_cuda:
+        raise ValueError("x and weight must be on the same GPU")
+    if not x.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("x and weight must be contiguous")
+
+    n, k = weight.shape
+    if k == 0:
+        raise ValueError("K must be non-zero")
+    if k > 65536:
+        raise ValueError("K is too large for the row-CTA reduction")
+    if out is None:
+        out = torch.empty((1, n), device=x.device, dtype=torch.float32)
+    elif (
+        out.shape != (1, n)
+        or out.dtype != torch.float32
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(f"out must be contiguous FP32 with shape {(1, n)}")
+    if n == 0:
+        return out
+    if out.untyped_storage().data_ptr() in {
+        x.untyped_storage().data_ptr(),
+        weight.untyped_storage().data_ptr(),
+    }:
+        raise ValueError("out must not alias x or weight storage")
+
+    block_k = triton.next_power_of_2(k)
+    _fp32_decode_gemv_kernel[(n,)](
+        x,
+        weight,
+        out,
+        K=k,
+        BLOCK_K=block_k,
+        num_warps=8 if block_k >= 4096 else 4,
     )
     return out
