@@ -28,6 +28,9 @@ from tokenspeed_kernel.ops.activation.triton import (
 )
 from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul as triton_situ_and_mul
+from tokenspeed_kernel.ops.activation.triton import (
+    triton_attention_gate_mul as attention_gate_mul,
+)
 from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
@@ -110,6 +113,7 @@ def situ_and_mul(
 
 __all__ = [
     "add3",
+    "attention_gate_mul",
     "prepare_fp8_linear_activation",
     "silu_and_mul",
     "situ_and_mul",

@@ -22,9 +22,13 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "add3",
@@ -35,7 +39,136 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     "swiglu_oai",
+    "triton_attention_gate_mul",
 ]
+
+
+@triton.jit(do_not_specialize=["floor", "temperature"])
+def _attention_gate_mul_kernel(
+    output_ptr,
+    gate_ptr,
+    bias_ptr,
+    num_elements,
+    floor,
+    temperature,
+    HIDDEN_DIM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    GATE_ROW_STRIDE: tl.constexpr,
+    GATE_HEAD_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_elements
+    row = offsets // HIDDEN_DIM
+    column = offsets % HIDDEN_DIM
+    head = column // HEAD_DIM
+    dimension = column % HEAD_DIM
+    gate = tl.load(
+        gate_ptr + row * GATE_ROW_STRIDE + head * GATE_HEAD_STRIDE + dimension,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    bias = tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
+    output = tl.load(output_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    multiplier = floor + (1.0 - floor) * tl.sigmoid((gate + bias) / temperature)
+    tl.store(output_ptr + offsets, output * multiplier, mask=mask)
+
+
+@register_kernel(
+    "activation",
+    "attention_gate_mul",
+    name="triton_attention_gate_mul",
+    solution="triton",
+    signatures=frozenset(
+        format_signature(
+            output=dense_tensor_format(dtype),
+            gate=dense_tensor_format(dtype),
+            head_bias=dense_tensor_format(bias_dtype),
+        )
+        for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        for bias_dtype in (torch.bfloat16, torch.float32)
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_attention_gate_mul(
+    output: torch.Tensor,
+    gate: torch.Tensor,
+    head_bias: torch.Tensor,
+    floor: float,
+    temperature: float,
+) -> torch.Tensor:
+    """Apply a biased per-head attention gate in place.
+
+    Compute ``output *= floor + (1-floor) * sigmoid((gate+bias)/temperature)``
+    in FP32 and round to the output dtype on store. All tensors must share
+    a CUDA or ROCm device. Nonempty output storage must be separate from
+    gate and bias storage, including disjoint views of one allocation.
+
+    Args:
+        output: Contiguous BF16, FP16 or FP32 tensor shaped ``[T, H * D]``.
+        gate: Same dtype as output; shaped ``[T, H * D]`` or ``[T, H, D]``.
+            Token/head strides are supported; the final stride must be one.
+        head_bias: Contiguous BF16 or FP32 vector shaped ``[H]``, with H > 0.
+        floor: Finite value mixed with the sigmoid multiplier.
+        temperature: Finite, strictly positive sigmoid temperature.
+
+    Returns:
+        The supplied output tensor, updated in place. Empty outputs launch
+        no kernel.
+    """
+    if output.dim() != 2 or not output.is_contiguous():
+        raise ValueError("output must be a contiguous rank-2 tensor")
+    if output.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError("output must have BF16, FP16 or FP32 dtype")
+    if gate.dim() not in (2, 3):
+        raise ValueError("gate must be rank 2 or 3")
+    if gate.dtype != output.dtype:
+        raise TypeError("gate must match output dtype")
+    if not output.is_cuda or gate.device != output.device:
+        raise ValueError("output and gate must be on the same GPU")
+    if gate.stride(-1) != 1:
+        raise ValueError("gate must have a contiguous final dimension")
+    if head_bias.dim() != 1 or head_bias.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("head_bias must be a rank-1 BF16 or FP32 tensor")
+    if head_bias.device != output.device or not head_bias.is_contiguous():
+        raise ValueError("head_bias must be contiguous and share output's device")
+    if not math.isfinite(floor):
+        raise ValueError("floor must be finite")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("temperature must be finite and positive")
+
+    tokens, width = output.shape
+    heads = head_bias.numel()
+    if heads == 0 or width % heads != 0:
+        raise ValueError("nonzero bias length must divide output width")
+    head_dim = width // heads
+    expected_shape = output.shape if gate.dim() == 2 else (tokens, heads, head_dim)
+    if gate.shape != expected_shape:
+        raise ValueError("gate shape must match output and bias dimensions")
+    if output.numel() == 0:
+        return output
+    if output.untyped_storage().data_ptr() in {
+        gate.untyped_storage().data_ptr(),
+        head_bias.untyped_storage().data_ptr(),
+    }:
+        raise ValueError("output must not share storage with gate or head_bias")
+
+    block = 256
+    _attention_gate_mul_kernel[(triton.cdiv(output.numel(), block),)](
+        output,
+        gate,
+        head_bias,
+        output.numel(),
+        floor,
+        temperature,
+        HIDDEN_DIM=width,
+        HEAD_DIM=head_dim,
+        GATE_ROW_STRIDE=gate.stride(0),
+        GATE_HEAD_STRIDE=head_dim if gate.dim() == 2 else gate.stride(1),
+        BLOCK=block,
+        num_warps=4,
+    )
+    return output
 
 
 @triton.jit
