@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
@@ -453,6 +457,216 @@ def qk_rmsnorm(
 
 
 @triton.jit
+def _staged_qk_rmsnorm_ssmax_kernel(
+    q_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    positions_ptr,
+    scale_table_ptr,
+    Q_STRIDE: tl.constexpr,
+    K_STRIDE: tl.constexpr,
+    Q_HEADS: tl.constexpr,
+    K_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TABLE_SIZE: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HEADS_PER_CTA: tl.constexpr,
+):
+    groups = tl.cdiv(Q_HEADS + K_HEADS, HEADS_PER_CTA)
+    program = tl.program_id(0).to(tl.int64)
+    token = program // groups
+    head = (program % groups) * HEADS_PER_CTA + tl.arange(0, HEADS_PER_CTA)
+    dimension = tl.arange(0, BLOCK)
+    is_k = head >= Q_HEADS
+    local_head = tl.where(is_k, head - Q_HEADS, head)
+    valid = head < Q_HEADS + K_HEADS
+    q_mask = (valid & ~is_k)[:, None] & (dimension < HEAD_DIM)[None, :]
+    k_mask = (valid & is_k)[:, None] & (dimension < HEAD_DIM)[None, :]
+    q = tl.load(
+        q_ptr + token * Q_STRIDE + local_head[:, None] * HEAD_DIM + dimension[None, :],
+        mask=q_mask,
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr + token * K_STRIDE + local_head[:, None] * HEAD_DIM + dimension[None, :],
+        mask=k_mask,
+        other=0.0,
+    )
+    x = tl.where(is_k[:, None], k, q).to(tl.float32)
+    q_weight = tl.load(q_weight_ptr + dimension, mask=dimension < HEAD_DIM, other=0.0)
+    k_weight = tl.load(k_weight_ptr + dimension, mask=dimension < HEAD_DIM, other=0.0)
+    weight = tl.where(is_k[:, None], k_weight[None, :], q_weight[None, :])
+    weight = weight.to(tl.bfloat16).to(tl.float32)
+    variance = tl.sum(x * x, axis=1) / HEAD_DIM
+    normalized = (x * tl.rsqrt(variance[:, None] + EPS)).to(tl.bfloat16)
+    affine = (normalized.to(tl.float32) * weight).to(tl.bfloat16)
+
+    position = tl.load(positions_ptr + token).to(tl.int64)
+    valid_position = (position >= 0) & (position < TABLE_SIZE)
+    safe_position = tl.where(valid_position, position, 0)
+    scale = tl.load(
+        scale_table_ptr + safe_position, mask=valid_position, other=float("nan")
+    )
+    output = tl.where(
+        is_k[:, None], affine.to(tl.float32), affine.to(tl.float32) * scale
+    )
+    q_base = token * Q_HEADS * HEAD_DIM + local_head[:, None] * HEAD_DIM
+    k_base = token * K_HEADS * HEAD_DIM + local_head[:, None] * HEAD_DIM
+    tl.store(q_out_ptr + q_base + dimension[None, :], output, mask=q_mask)
+    tl.store(k_out_ptr + k_base + dimension[None, :], output, mask=k_mask)
+
+
+@register_kernel(
+    "layernorm",
+    "staged_qk_rmsnorm_ssmax",
+    name="triton_staged_qk_rmsnorm_ssmax",
+    solution="triton",
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_staged_qk_rmsnorm_ssmax(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    scale_table: torch.Tensor,
+    eps: float,
+    out: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply staged BF16 per-head RMSNorm and position-indexed Q scaling.
+
+    Compute mean squares in FP32. Round normalized values and weights to
+    BF16 before affine multiplication, then round the affine result to BF16.
+    Multiply Q by the FP32 scale for its absolute position and round to BF16;
+    K receives only the normalization and affine operations.
+
+    Args:
+        q: BF16 queries shaped ``[T, QH * D]``, with a contiguous last axis.
+        k: BF16 keys shaped ``[T, KH * D]``, with a contiguous last axis.
+            Both inputs allow token strides; head counts must be positive.
+        q_weight: Contiguous BF16 or FP32 vector of length ``D``, 1 to 1024.
+        k_weight: Contiguous BF16 or FP32 vector of the same length.
+        positions: Contiguous INT32 or INT64 absolute positions shaped ``[T]``.
+        scale_table: Nonempty contiguous FP32 vector of caller-defined scales.
+            A position outside ``[0, len(scale_table))`` produces NaNs in its
+            Q row without an out-of-bounds read; its K row is unaffected.
+        eps: Finite, strictly positive RMSNorm epsilon.
+        out: Pair of contiguous BF16 destinations matching Q/K, or ``None``
+            to allocate them. Nonempty destinations require separate storage
+            from every input and from each other, including disjoint views.
+
+    Returns:
+        Contiguous BF16 ``(q_out, k_out)`` matching the input shapes. A supplied
+        pair is returned directly. Empty token batches launch no kernel. All
+        tensors must share one CUDA or ROCm device.
+    """
+    if q.dim() != 2 or k.dim() != 2 or q.shape[0] != k.shape[0]:
+        raise ValueError("q and k must be rank 2 with matching token counts")
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
+        raise TypeError("q and k must have BF16 dtype")
+    inputs = (q, k, q_weight, k_weight, positions, scale_table)
+    if not q.is_cuda or any(t.device != q.device for t in inputs):
+        raise ValueError("all inputs must share one GPU")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("q and k require a contiguous last axis")
+    if (
+        q_weight.dim() != 1
+        or k_weight.shape != q_weight.shape
+        or not 1 <= q_weight.numel() <= 1024
+    ):
+        raise ValueError("weights must be vectors of equal length from 1 to 1024")
+    for weight in (q_weight, k_weight):
+        if weight.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError("weights must have BF16 or FP32 dtype")
+        if not weight.is_contiguous():
+            raise ValueError("weights must be contiguous")
+    head_dim = q_weight.numel()
+    if any(t.shape[1] == 0 or t.shape[1] % head_dim != 0 for t in (q, k)):
+        raise ValueError("q and k widths must be positive multiples of head_dim")
+    tokens = q.shape[0]
+    if positions.shape != (tokens,) or not positions.is_contiguous():
+        raise ValueError("positions must be a contiguous vector of length T")
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("positions must have INT32 or INT64 dtype")
+    if (
+        scale_table.dim() != 1
+        or not scale_table.is_contiguous()
+        or scale_table.numel() == 0
+    ):
+        raise ValueError("scale_table must be a nonempty contiguous vector")
+    if scale_table.dtype != torch.float32:
+        raise TypeError("scale_table must have FP32 dtype")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be finite and positive")
+
+    if out is None:
+        out = (
+            torch.empty(q.shape, dtype=q.dtype, device=q.device),
+            torch.empty(k.shape, dtype=k.dtype, device=k.device),
+        )
+    elif not isinstance(out, tuple) or len(out) != 2:
+        raise ValueError("out must be a pair of output tensors or None")
+    for destination, source in zip(out, (q, k)):
+        if (
+            not isinstance(destination, torch.Tensor)
+            or destination.shape != source.shape
+            or destination.dtype != source.dtype
+            or destination.device != source.device
+            or not destination.is_contiguous()
+        ):
+            raise ValueError("outputs must be contiguous BF16 tensors matching q and k")
+    if tokens == 0:
+        return out
+    storage = {t.untyped_storage().data_ptr() for t in inputs}
+    for destination in out:
+        pointer = destination.untyped_storage().data_ptr()
+        if pointer in storage:
+            raise ValueError(
+                "output storage must be separate from inputs and other outputs"
+            )
+        storage.add(pointer)
+
+    q_heads, k_heads = q.shape[1] // head_dim, k.shape[1] // head_dim
+    heads_per_cta = 4
+    _staged_qk_rmsnorm_ssmax_kernel[
+        (tokens * triton.cdiv(q_heads + k_heads, heads_per_cta),)
+    ](
+        q,
+        k,
+        out[0],
+        out[1],
+        q_weight,
+        k_weight,
+        positions,
+        scale_table,
+        Q_STRIDE=q.stride(0),
+        K_STRIDE=k.stride(0),
+        Q_HEADS=q_heads,
+        K_HEADS=k_heads,
+        HEAD_DIM=head_dim,
+        TABLE_SIZE=scale_table.numel(),
+        EPS=eps,
+        BLOCK=triton.next_power_of_2(head_dim),
+        HEADS_PER_CTA=heads_per_cta,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+@triton.jit
 def _fused_qk_rmsnorm_rope_gate_kernel(
     q_gate_ptr,
     k_ptr,
@@ -875,6 +1089,7 @@ __all__ = [
     "grouped_gemma_rmsnorm",
     "rmsnorm",
     "qk_rmsnorm",
+    "triton_staged_qk_rmsnorm_ssmax",
     "fused_qk_rmsnorm_rope_gate",
     "fused_qk_rmsnorm_rope",
     "rmsnorm_fused_parallel",
