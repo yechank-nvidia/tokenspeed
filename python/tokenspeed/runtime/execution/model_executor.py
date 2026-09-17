@@ -534,6 +534,19 @@ class ModelExecutor:
 
         logger.info("ModelExecutor initialized")
 
+    def close(self) -> None:
+        """Drain device work and release graph owners on the forward thread."""
+        self.device_module.synchronize()
+        self.forward_step.close()
+        self.prefill_graph.close()
+        for wrapper in self.encoder_graph_wrappers.values():
+            wrapper.close()
+        if self.drafter is not None:
+            for wrapper in getattr(
+                self.drafter.draft_model_runner, "encoder_graph_wrappers", {}
+            ).values():
+                wrapper.close()
+
     def capture_graphs(self) -> None:
         """Tune the kernels, pin the workspace, then capture the graphs.
 

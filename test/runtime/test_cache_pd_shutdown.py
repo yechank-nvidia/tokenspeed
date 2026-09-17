@@ -62,6 +62,7 @@ class _EventLoopHarness:
     def __init__(self, *, pre_set: bool) -> None:
         self.trace: list[str] = []
         self.shutdown_event = threading.Event()
+        self.request_handler = SimpleNamespace(shutdown_received=pre_set)
         if pre_set:
             self.shutdown_event.set()
         self._pause = _PauseHarness(self.trace)
@@ -92,9 +93,10 @@ class _EventLoopHarness:
 
     def _process_new_requests(self) -> None:
         self.trace.append("process_requests")
-        # Exercise the important case where SIGTERM arrives during an
-        # iteration: finish this scheduler step, then stop at the next head.
+        # Model a replicated stop received during this iteration: finish the
+        # scheduler step, then stop at the next head, never on local TERM alone.
         self.shutdown_event.set()
+        self.request_handler.shutdown_received = True
 
     def _publish_scheduler_kv_events(self) -> None:
         self.trace.append("publish_kv")
@@ -116,7 +118,7 @@ class _EventLoopHarness:
         self.trace.append("metrics")
 
 
-def test_event_loop_returns_without_work_when_shutdown_is_pre_set() -> None:
+def test_event_loop_returns_without_work_when_shutdown_was_received() -> None:
     loop = _EventLoopHarness(pre_set=True)
 
     EventLoop.event_loop(loop)
@@ -207,10 +209,10 @@ def test_run_event_loop_reports_exit_and_finally_closes(
             _attn_tp_rank,
             _dp_rank,
             _global_rank,
-            shutdown_event,
+            shutdown_requested,
         ) -> None:
             trace.append("construct")
-            self.shutdown_event = shutdown_event
+            self.shutdown_requested = shutdown_requested
             self.max_total_num_tokens = 1024
             self.max_single_request_tokens = 768
             self.max_model_len = 4096
@@ -222,14 +224,24 @@ def test_run_event_loop_reports_exit_and_finally_closes(
 
         def event_loop(self) -> None:
             trace.append("loop_enter")
-            assert not self.shutdown_event.is_set()
+            assert not self.shutdown_requested()
             if exit_kind == "system_exit":
                 raise SystemExit(0)
             if exit_kind == "sigterm":
                 handler = installed_handler["value"]
                 assert callable(handler)
-                handler(signal.SIGTERM, None)
-                assert self.shutdown_event.is_set()
+                # A repeated TERM must not acquire Event/Condition locks.
+                with monkeypatch.context() as signal_patch:
+                    signal_patch.setattr(
+                        threading.Event,
+                        "set",
+                        lambda _self: pytest.fail(
+                            "signal handler acquired an Event lock"
+                        ),
+                    )
+                    handler(signal.SIGTERM, None)
+                    handler(signal.SIGTERM, None)
+                assert self.shutdown_requested()
                 assert not exit_logs
             trace.append("loop_return")
 

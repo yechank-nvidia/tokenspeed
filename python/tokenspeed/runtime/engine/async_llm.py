@@ -96,7 +96,7 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
-from tokenspeed.runtime.utils.process import kill_process_tree
+from tokenspeed.runtime.utils.process import kill_process_tree, stop_owned_processes
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -175,6 +175,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
         self.gracefully_exit = False
+        self.scheduler_processes = ()
+        self._sigterm_watchdog_task = None
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -265,9 +267,13 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     ):
         created_time = time.time()
 
+        if self.gracefully_exit:
+            raise RuntimeError("Engine is shutting down")
         self.auto_create_handle_loop()
 
         await self._generation_admit.wait()
+        if self.gracefully_exit:
+            raise RuntimeError("Engine is shutting down")
         self.input_processor.validate_request(obj)
 
         obj.normalize_batch_and_arguments()
@@ -280,6 +286,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             )
 
         async with self.model_update_lock.reader_lock:
+            if self.gracefully_exit:
+                raise RuntimeError("Engine is shutting down")
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
@@ -675,9 +683,10 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        self._sigterm_watchdog_task = loop.create_task(
+            print_exception_wrapper(self.sigterm_watchdog)
         )
+        self.asyncio_tasks.add(self._sigterm_watchdog_task)
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.load_snapshot_loop))
         )
@@ -711,6 +720,44 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             await server.serve()
         except Exception as e:  # noqa: BLE001
             logger.error("RL control plane stopped: %s", e)
+
+    async def shutdown_owned_schedulers(self, *, timeout_seconds):
+        """Close admission, drain readers, and reap the exact launched children."""
+        if not 0 < timeout_seconds < float("inf"):
+            raise ValueError("timeout_seconds must be positive and finite")
+        if not self.scheduler_processes:
+            raise RuntimeError("scheduler process ownership was not published")
+        deadline = time.monotonic() + timeout_seconds
+        watchdog = self._sigterm_watchdog_task
+        if watchdog is not None:
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
+        self.gracefully_exit = True
+        # A request paused before acquiring its reader lock must wake and reject;
+        # holding it at admission cannot participate in the writer drain barrier.
+        self._generation_admit.set()
+        failure = None
+        try:
+            async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                # generate_request holds a reader across tokenization and streaming.
+                # The writer closes the gap before a tokenized request has a rid.
+                async with self.model_update_lock.writer_lock:
+                    while self.rid_to_state:
+                        await asyncio.sleep(0.05)
+        except BaseException as exc:
+            failure = exc
+        try:
+            await asyncio.to_thread(
+                stop_owned_processes,
+                self.scheduler_processes,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
+            )
+        except BaseException as exc:
+            if failure is not None:
+                exc.add_note(f"request drain also failed: {failure!r}")
+            raise
+        if failure is not None:
+            raise failure
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

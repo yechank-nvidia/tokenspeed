@@ -512,7 +512,7 @@ def set_weight_attrs(
 
 
 class PipelinedPyobjBroadcaster:
-    """Overlap empty Python-object notifications with useful work."""
+    """Overlap notifications, including source-owned shutdown, with useful work."""
 
     def __init__(
         self,
@@ -531,10 +531,10 @@ class PipelinedPyobjBroadcaster:
     def in_flight(self) -> bool:
         return self._work is not None
 
-    def start(self, data: list[Any] | None) -> None:
+    def start(self, data: list[Any] | None, *, shutdown_requested: bool) -> None:
         self._data = data
         if self.rank == self.src:
-            self._ready[0] = bool(data)
+            self._ready[0] = -1 if shutdown_requested else bool(data)
         self._work = dist.broadcast(
             self._ready,
             src=self.src,
@@ -542,12 +542,16 @@ class PipelinedPyobjBroadcaster:
             async_op=True,
         )
 
-    def finish(self) -> list[Any]:
+    def finish(self) -> list[Any] | None:
+        """Return the next payload, or None for the replicated stop boundary."""
         self._work.wait()
         data = self._data
         self._data = None
         self._work = None
-        if self._ready.item():
+        ready = self._ready.item()
+        if ready == -1:
+            return None
+        if ready:
             return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
         return data or []
 

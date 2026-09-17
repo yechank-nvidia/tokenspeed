@@ -301,6 +301,14 @@ class ForwardStepRunner:
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
 
+    def close(self) -> None:
+        """Reset owned graphs after device synchronization, before group teardown."""
+        for graph in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+        self.output_buffers.clear()
+        self._metadata_snapshots.clear()
+
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------

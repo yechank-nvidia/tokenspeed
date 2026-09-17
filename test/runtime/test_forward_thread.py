@@ -104,3 +104,23 @@ def test_sync_requires_a_copy_event():
     results = ModelExecutionResult(output_tokens=torch.tensor([7], dtype=torch.int32))
     with pytest.raises(RuntimeError, match="copy_event is required"):
         results.sync()
+
+
+def test_shutdown_drains_fifo_and_rejects_late_submission(thread):
+    trace = []
+    thread.submit(lambda: trace.append("queued"))
+    thread.shutdown()
+    assert trace == ["queued"]
+    assert not thread._thread.is_alive()
+    thread.shutdown()
+    with pytest.raises(RuntimeError, match="shut down"):
+        thread.submit(lambda: None)
+
+
+def test_shutdown_join_timeout_is_reported(thread, monkeypatch):
+    thread.shutdown()
+    stuck = SimpleNamespace(join=lambda **_kwargs: None, is_alive=lambda: True)
+    with monkeypatch.context() as patch:
+        patch.setattr(thread, "_thread", stuck)
+        with pytest.raises(TimeoutError, match="did not stop"):
+            thread.shutdown()

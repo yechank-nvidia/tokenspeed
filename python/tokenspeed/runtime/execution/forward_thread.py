@@ -148,6 +148,8 @@ class ForwardThread:
                 if resolved.index is not None
                 else device_module.current_device()
             )
+        self._closed = False
+        self._shutdown_lock = threading.Lock()
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._thread = threading.Thread(
             target=self._run, name="tokenspeed::forward", daemon=True
@@ -183,7 +185,10 @@ class ForwardThread:
             A future resolved with ``fn``'s return value, or its exception.
         """
         future: Future = Future()
-        self._queue.put((fn, future))
+        with self._shutdown_lock:
+            if self._closed:
+                raise RuntimeError("Forward thread is shut down")
+            self._queue.put((fn, future))
         return future
 
     def run(self, fn: Callable[[], Any]) -> Any:
@@ -203,5 +208,10 @@ class ForwardThread:
         return self.submit(fn).result()
 
     def shutdown(self) -> None:
-        self._queue.put(None)
+        with self._shutdown_lock:
+            if not self._closed:
+                self._closed = True
+                self._queue.put(None)
         self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            raise TimeoutError("Forward thread did not stop")

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 import psutil
 import setproctitle
@@ -141,7 +142,7 @@ class EventLoop:
         attn_tp_rank: int,
         dp_rank: int,
         global_rank: int,
-        shutdown_event: threading.Event | None = None,
+        shutdown_requested: Callable[[], bool],
     ) -> None:
         # Do not pass server_args further down the stack after this point.
 
@@ -149,7 +150,7 @@ class EventLoop:
         self.port_args = port_args
         self.gpu_id = gpu_id
         self.global_rank = global_rank
-        self.shutdown_event = shutdown_event or threading.Event()
+        self._shutdown_requested = shutdown_requested
 
         self.model_config = self._load_model_config(server_args.model)
         if server_args.speculative_draft_model_path is not None:
@@ -639,7 +640,9 @@ class EventLoop:
             self.output_processor.mark_abort(request_id)
 
     def _process_new_requests(self):
-        recv_reqs = self.request_handler.recv_reqs()
+        recv_reqs = self.request_handler.recv_reqs(
+            shutdown_requested=self._shutdown_requested()
+        )
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
         pause_blocked_before = self._pause.admit_blocked
@@ -893,7 +896,7 @@ class EventLoop:
     # ------------------------------------------------------------------
 
     def _shutdown_complete(self) -> bool:
-        return self.shutdown_event.is_set()
+        return self.request_handler.shutdown_received
 
     def _drain_in_flight(self, in_flight) -> list:
         """Commit every queued forward, oldest first; return their changes."""
@@ -1148,16 +1151,20 @@ class EventLoop:
         return GrammarStepInputs(grammars=grammars, advance_mask=advance_mask)
 
     def close(self) -> None:
-        self.load_reporter.close()
-        # Best-effort: tell an attached SMG frontend this engine is going away
-        # (msgpack mode only; the pickle sender has no such helper) so the
-        # worker is marked dead instead of staying healthy-idle.
-        send_engine_dead = getattr(self.send_to_tokenizer, "send_engine_dead", None)
-        if callable(send_engine_dead):
-            send_engine_dead()
-        close_transfer = getattr(self.kv_transfer, "close", None)
-        if callable(close_transfer):
-            close_transfer()
+        try:
+            self._device.close()
+            pg_manager.close(timeout_seconds=30.0)
+        finally:
+            self.load_reporter.close()
+            # Best-effort: tell an attached SMG frontend this engine is going away
+            # (msgpack mode only; the pickle sender has no such helper) so the
+            # worker is marked dead instead of staying healthy-idle.
+            send_engine_dead = getattr(self.send_to_tokenizer, "send_engine_dead", None)
+            if callable(send_engine_dead):
+                send_engine_dead()
+            close_transfer = getattr(self.kv_transfer, "close", None)
+            if callable(close_transfer):
+                close_transfer()
 
 
 def run_event_loop(
@@ -1186,15 +1193,15 @@ def run_event_loop(
     configure_logger(server_args, prefix=prefix)
 
     event_loop = None
-    shutdown_event = threading.Event()
     received_signal = None
     previous_sigterm_handler = None
 
     def request_shutdown(signum, _frame):
         nonlocal received_signal
-        # Defer logging until outside the signal handler (logging takes locks).
+        # Only record state: even Event.set() takes a non-reentrant lock and
+        # can deadlock if another TERM interrupts it. The loop reads this state
+        # on the same main thread; logging and synchronization stay outside.
         received_signal = signum
-        shutdown_event.set()
 
     try:
         if server_args.disaggregation_mode == "encode":
@@ -1222,7 +1229,7 @@ def run_event_loop(
             attn_tp_rank,
             dp_rank,
             global_rank,
-            shutdown_event,
+            lambda: received_signal is not None,
         )
         pipe_writer.send(
             {
@@ -1249,6 +1256,7 @@ def run_event_loop(
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGUSR1)
+        raise
     finally:
         # SystemExit/KeyboardInterrupt bypass the Exception handler above;
         # report their traceback without swallowing or changing the exit status.
@@ -1257,7 +1265,7 @@ def run_event_loop(
             "Scheduler exiting: rank=%d pid=%d shutdown_requested=%s signal=%s",
             global_rank,
             os.getpid(),
-            shutdown_event.is_set(),
+            received_signal is not None,
             received_signal,
             exc_info=exception_info if exception_info[0] is not None else None,
         )
@@ -1266,10 +1274,11 @@ def run_event_loop(
                 event_loop.close()
             except Exception:  # noqa: BLE001 - best-effort teardown; signal parent
                 logger.error(
-                    "Scheduler transport shutdown failed: %s",
+                    "Scheduler shutdown failed: %s",
                     get_exception_traceback(),
                 )
                 parent_process.send_signal(signal.SIGUSR1)
+                raise
         if (
             previous_sigterm_handler is not None
             and threading.current_thread() is threading.main_thread()

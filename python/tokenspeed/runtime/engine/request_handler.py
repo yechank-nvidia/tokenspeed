@@ -115,6 +115,7 @@ class RequestHandler:
     ) -> None:
 
         self.forward_ct = 0
+        self.shutdown_received = False
         self.server_args = server_args
         # Owns pause/resume state; shared with the event loop. See pause.py.
         self.pause_controller = pause_controller
@@ -202,19 +203,33 @@ class RequestHandler:
 
         return recv_reqs
 
-    def recv_reqs(self) -> list:
+    def recv_reqs(self, *, shutdown_requested: bool) -> list:
         if self.attn_tp_size == 1:
+            if shutdown_requested:
+                self.shutdown_received = True
+                return []
             recv_reqs = self._drain_reqs()
         else:
             if not self.req_broadcaster.in_flight:
-                self.req_broadcaster.start(self._drain_reqs())
+                self.req_broadcaster.start(
+                    None if shutdown_requested else self._drain_reqs(),
+                    shutdown_requested=shutdown_requested,
+                )
             recv_reqs = self.req_broadcaster.finish()
+            if recv_reqs is None:
+                # Every rank consumes the same header and leaves no speculative
+                # request broadcast ahead of the final process-group barrier.
+                self.shutdown_received = True
+                return []
 
         if recv_reqs:
             prepare_shm_features(recv_reqs, self.attn_tp_cpu_group)
 
         if self.attn_tp_size != 1:
-            self.req_broadcaster.start(self._drain_reqs())
+            self.req_broadcaster.start(
+                None if shutdown_requested else self._drain_reqs(),
+                shutdown_requested=shutdown_requested,
+            )
 
         return recv_reqs
 

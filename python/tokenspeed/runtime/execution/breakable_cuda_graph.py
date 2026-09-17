@@ -178,6 +178,7 @@ class BreakableCapture:
     ) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
+        self._graphs: list[torch.cuda.CUDAGraph] = []
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing = False
         if stream is None:
@@ -242,12 +243,24 @@ class BreakableCapture:
             return
         assert self._current_graph is not None
         self._current_graph.capture_end()
+        self._graphs.append(self._current_graph)
         self.segments.append(self._current_graph.replay)
         # All segments share one pool so intermediate addresses stay stable.
         if self.pool is None:
             self.pool = self._current_graph.pool()
         self._current_graph = None
         self._capturing = False
+
+    def close(self) -> None:
+        """Reset completed graph segments after device work has synchronized."""
+        if self._capturing or BreakableCapture.current() is not None:
+            raise RuntimeError("Cannot close graphs during an active BreakableCapture")
+        for graph in self._graphs:
+            graph.reset()
+        self._graphs.clear()
+        self.segments.clear()
+        self._handoff.clear()
+        self.pool = None
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
         """End the current segment, run ``fn`` eagerly, record it, start a new one.

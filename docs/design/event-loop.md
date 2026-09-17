@@ -290,6 +290,54 @@ For orientation, one iteration of `event_loop`:
    `request_changes`, publish KV events (once), and resolve any pending
    pause/release drain.
 
+## Shutdown ownership and ordering
+
+The frontend closes admission and drains admitted requests before signalling
+the scheduler processes it launched. Drain covers the request reader lock,
+including tokenization before a request id is registered. Nonzero-node blocking
+launchers own the same TERM-and-reap contract; returning no frontend is successful
+only with an explicit completed-follower marker. A timeout, forced kill, runtime
+exception, or nonzero child exit remains a failure.
+Requests after shutdown must reject before creating frontend background loops or
+the SIGTERM watchdog, even when shutdown precedes the first request.
+
+Local TERM requests do not themselves end a TP loop. The request-broadcast source
+publishes a stop header through the existing pipelined request stream; every rank
+consumes that same header and stops enqueueing lookahead broadcasts before leaving
+the loop. Earlier queued payloads still finish normally. Otherwise asynchronous
+rank-local exits can leave an unmatched broadcast and different Gloo collective
+tags at the final barrier. This adds no per-round collective or second execution
+path. Supervisors must request shutdown of the source as well as its peers; a
+peer-only failure does not constitute a graceful distributed stop.
+
+The scheduler's signal handler only records the received signal; the loop reads
+it on the same main thread. Do not log or set a threading Event in this handler:
+both acquire locks, and repeated TERM can interrupt and re-enter the handler.
+Signal delivery must not acquire a lock that an interrupted invocation may hold.
+
+After the ordinary loop stops, `DeviceHandle.close` queues `ModelExecutor.close`
+behind all submitted FIFO work, settles cache/transfer submissions, and joins the
+forward thread. The executor synchronizes device work and explicitly resets its
+decode, breakable-prefill, and target/draft encoder graphs through their owners.
+Graph release must precede process-group teardown: a captured collective can
+retain its communicator even after all device work completes. Both synchronization
+and graph reset stay on the data plane; live captures and reset failures remain
+errors. Teardown introduces no scheduler advance or per-round execution path.
+
+Only then may the process-group manager destroy registered device groups and
+shut down the default device group. The existing world Gloo group remains alive
+for a bounded monitored barrier: all ranks must have stopped their device-group
+heartbeat owners before rank 0 releases the shared store. A barrier **before**
+device-group shutdown does not establish this ordering. Final c10d destruction
+releases the remaining groups, and successful teardown clears cached references.
+
+This ordering uses public `ProcessGroup.shutdown`; final c10d destruction calls
+it again for WORLD. Supported backend/build combinations must tolerate that
+sequence. Missing prerequisites or cleanup errors propagate rather than falling
+back to a successful exit. The barrier deadline does not bound backend shutdown
+itself; the owning process supervisor retains the overall cleanup deadline.
+This ordinary TP path does not claim graceful encode/DP-controller supervision.
+
 ## Checklist for extending the loop
 
 * New logic that reacts to scheduler/transfer/cache progress: put it in the

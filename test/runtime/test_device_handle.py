@@ -40,6 +40,7 @@ than walk to it.
 from __future__ import annotations
 
 import ast
+import threading
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -48,6 +49,7 @@ import torch
 from tokenspeed_scheduler import PD
 
 from tokenspeed.runtime.execution.device import DeviceHandle
+from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -768,3 +770,52 @@ def test_collaborators_hold_the_handle_instead_of_walking_to_it():
         source = inspect.getsource(module)
         assert "loop.device" not in source
         assert "loop._device" not in source
+
+
+def test_close_runs_executor_close_after_fifo_work_on_forward_thread():
+    trace = []
+    thread = ForwardThread(torch.device("cpu"))
+    thread.submit(lambda: trace.append(("queued", threading.get_ident())))
+    executor = SimpleNamespace(
+        forward_thread=thread,
+        close=lambda: trace.append(("close", threading.get_ident())),
+    )
+    handle = DeviceHandle(executor)
+    try:
+        handle.close()
+        assert [stage for stage, _ in trace] == ["queued", "close"]
+        assert trace[0][1] == trace[1][1] != threading.get_ident()
+        assert not thread._thread.is_alive()
+    finally:
+        thread.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["executor", "cache", "transfer"])
+def test_close_propagates_device_work_failure_and_joins(failure):
+    thread = ForwardThread(torch.device("cpu"))
+
+    def close():
+        if failure == "executor":
+            raise ValueError("executor close failed")
+
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=thread,
+            close=close,
+        )
+    )
+    if failure != "executor":
+        pending = Future()
+        pending.set_exception(ValueError("queued work failed"))
+        submissions = (
+            handle._l2_submissions
+            if failure == "cache"
+            else handle._transfer_submissions
+        )
+        submissions.append(pending)
+    try:
+        with pytest.raises((ValueError, RuntimeError), match="failed"):
+            handle.close()
+        assert not thread._thread.is_alive()
+    finally:
+        thread.shutdown()

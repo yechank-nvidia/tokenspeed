@@ -120,5 +120,40 @@ class ProcessGroupManager:
                 if g == group:
                     self.register_process_group(backend, g, pg)
 
+    def close(self, *, timeout_seconds: float) -> None:
+        """Stop device groups before releasing their shared store.
+
+        Args:
+            timeout_seconds: Positive finite bound for the final CPU barrier.
+
+        Returns:
+            None after teardown, or after clearing already-uninitialized state.
+
+        The caller must first stop submissions and synchronize device work.
+        Cleanup failures propagate; a partially torn-down manager is not usable.
+        Final c10d destruction repeats WORLD.shutdown(), which was validated on
+        the supported torch build, not assumed idempotent for every backend.
+        """
+        if not 0 < timeout_seconds < float("inf"):
+            raise ValueError("shutdown timeout must be positive and finite")
+        timeout = timedelta(seconds=timeout_seconds)
+        if not dist.is_initialized():
+            self._process_groups.clear()
+            return
+        world_group = tuple(range(dist.get_world_size()))
+        world_gloo = self._process_groups["gloo"][world_group]
+        device_groups = tuple(self._process_groups[self._device_backend].values())
+        shutdown_world = getattr(dist.group.WORLD, "shutdown", None)
+        if not callable(shutdown_world):
+            raise RuntimeError("default process group does not support shutdown")
+        for process_group in reversed(device_groups):
+            dist.destroy_process_group(process_group)
+        shutdown_world()
+        # The retained Gloo group keeps rank 0 alive until peer NCCL heartbeat
+        # owners have stopped, rather than merely entered their cleanup path.
+        dist.monitored_barrier(group=world_gloo, timeout=timeout, wait_all_ranks=True)
+        dist.destroy_process_group()
+        self._process_groups.clear()
+
 
 process_group_manager = ProcessGroupManager()
