@@ -773,6 +773,67 @@ def test_decode_gemv_selection_respects_dtype():
         )
 
 
+@pytest.mark.parametrize("m", [2, 3, 8, 16, 32])
+@pytest.mark.parametrize("n,k", [(0, 17), (1, 1), (19, 127), (256, 5120), (3, 4097)])
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_fp32_decode_gemm_rows(m, n, k, preallocated):
+    torch.manual_seed(73 + m)
+    x = torch.randn(m, k, device="cuda")
+    weight = torch.randn(n, k, device="cuda")
+    out = torch.empty(m, n, device="cuda") if preallocated else None
+    result = decode_gemv(x, weight, out)
+    ref = (x.double() @ weight.double().t()).float()
+    torch.testing.assert_close(result, ref, rtol=2e-5, atol=2e-4)
+    if out is not None:
+        assert result is out
+    assert torch.equal(result, decode_gemv(x, weight, None))
+
+
+def test_fp32_decode_gemm_rows_selection_and_bounds():
+    from tokenspeed_kernel.ops.gemm.triton_gemv import (
+        torch_decode_gemv,
+        triton_rowcta_gemm_fp32,
+        triton_rowcta_gemv,
+    )
+
+    _select.cache_clear()
+    assert _select(1, 256, 5120, True, torch.float32) is triton_rowcta_gemv
+    for m in (2, 8, 32):
+        assert _select(m, 256, 5120, True, torch.float32) is triton_rowcta_gemm_fp32
+    assert _select(33, 256, 5120, True, torch.float32) is torch_decode_gemv
+    # BF16 rows above one keep their own routing; the FP32 kernel is dtype-gated.
+    assert _select(8, 256, 5120, True, torch.bfloat16) is not triton_rowcta_gemm_fp32
+    x = torch.ones(8, 4097, device="cuda")
+    weight = torch.ones(3, 4097, device="cuda")
+    torch.testing.assert_close(
+        decode_gemv(x, weight, None),
+        torch.full((8, 3), 4097.0, device="cuda"),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="CUDA graph replay requires NVIDIA"
+)
+def test_fp32_decode_gemm_rows_graph_replay():
+    x = torch.randn(8, 5120, device="cuda")
+    weight = torch.randn(256, 5120, device="cuda")
+    storage = torch.full((8, 257), 77.0, device="cuda")
+    out = storage[:, :256].contiguous()
+    decode_gemv(x, weight, out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert decode_gemv(x, weight, out) is out
+    for _ in range(2):
+        x.normal_()
+        weight.normal_()
+        graph.replay()
+        ref = (x.double() @ weight.double().t()).float()
+        torch.testing.assert_close(out, ref, rtol=2e-5, atol=2e-4)
+
+
 def test_fp32_decode_gemv_ignores_torch_reduced_precision():
     previous = torch.get_float32_matmul_precision()
     try:
