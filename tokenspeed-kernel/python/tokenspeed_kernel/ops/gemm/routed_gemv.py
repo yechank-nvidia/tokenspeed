@@ -30,9 +30,12 @@ cold-L2 reproduces serving per-shape times within ~5%.
 A backend earns an entry only by beating the incumbent selection by at least
 4% -- above measurement noise, so a noise-level lead does not become a
 maintenance obligation. Shapes not listed keep the selection they had
-(rowcta at M == 1, torch.mm otherwise). The table is data, not policy:
-re-run the sweep on new hardware or after a kernel change and replace the
-literals wholesale.
+(rowcta at M == 1, torch.mm otherwise). A ``"rowcta"`` entry records an
+M == 1 shape where that default beat cuBLAS by the same margin: direct
+``decode_gemv`` callers already had it, and the entry lets the linear layers,
+which reach ``decode_gemv`` only through this table, take it too. The table
+is data, not policy: re-run the sweep on new hardware or after a kernel
+change and replace the literals wholesale.
 """
 
 from __future__ import annotations
@@ -1047,19 +1050,23 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
+    from tokenspeed_kernel.ops.gemm.triton_gemv import triton_rowcta_gemv
+
     impls = {
         "skinny": cute_dsl_skinny_gemv,
         "tgv": flashinfer_tgv_gemv,
         "ll_bf16": cute_dsl_ll_bf16_gemv,
         "splitk": flashinfer_splitk_gemv,
+        "rowcta": triton_rowcta_gemv,
     }
+    solutions = {"tgv": "flashinfer", "splitk": "flashinfer", "rowcta": "triton"}
     for (m, n, k), backend in MEASURED_ROUTE.items():
         impl = impls[backend]
         register_kernel(
             "gemm",
             "decode_gemv",
             name=f"{impl.__name__}_m{m}_n{n}_k{k}",
-            solution="flashinfer" if backend in ("tgv", "splitk") else "cute_dsl",
+            solution=solutions.get(backend, "cute_dsl"),
             capability=_CAPABILITY,
             signatures=_BF16_SIG,
             traits={
