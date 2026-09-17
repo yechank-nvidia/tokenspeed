@@ -163,6 +163,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
         cache_seqlens=cache_seqlens,
         max_seqlen_k=2048,
         max_seqlen_q=1,
+        decode_workspace=None,
         window_left=window_left,
         solution="fa4",
     )
@@ -174,6 +175,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
         cache_seqlens=cache_seqlens,
         max_seqlen_k=2048,
         max_seqlen_q=1,
+        decode_workspace=None,
         window_left=window_left,
         q_scale=q_sf,
         k_scale=cache["k_scale"],

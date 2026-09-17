@@ -23,6 +23,9 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.attention.mha._workspace import (
+    prepare_mha_decode_workspace,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -429,6 +432,8 @@ def mha_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    decode_workspace: torch.Tensor | None,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
@@ -458,6 +463,11 @@ def mha_decode_with_kvcache(
         v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        decode_workspace: Required execution-metadata hint. Pass an immutable
+            [:batch] view from prepare_mha_decode_workspace, on q's device,
+            or None to retain per-call preparation. Keep its storage alive
+            until all captured graphs and in-flight readers are released.
+            Backends that do not use the hint consume and ignore it.
     """
     signature, scale_kwargs = _blockscaled_signature_and_scales(
         q, k_cache, v_cache, q_scale, k_scale, v_scale
@@ -524,6 +534,7 @@ def mha_decode_with_kvcache(
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
+            decode_workspace=decode_workspace,
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
         )
@@ -543,4 +554,5 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "prepare_mha_decode_workspace",
 ]

@@ -22,6 +22,9 @@ import math
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.mha._workspace import (
+    prepare_mha_decode_workspace,
+)
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
@@ -850,7 +853,22 @@ def _triton_mha_decode_with_kvcache_impl(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    *,
+    decode_workspace: torch.Tensor | None,
 ) -> torch.Tensor:
+    if decode_workspace is not None:
+        if not isinstance(decode_workspace, torch.Tensor):
+            raise TypeError("decode_workspace must be a tensor or None")
+        if decode_workspace.dtype != torch.int32:
+            raise ValueError("decode_workspace must have dtype int32")
+        if decode_workspace.device != q.device:
+            raise ValueError("decode_workspace must be on the query device")
+        if (
+            decode_workspace.ndim != 1
+            or not decode_workspace.is_contiguous()
+            or decode_workspace.shape[0] != cache_seqlens.shape[0]
+        ):
+            raise ValueError("decode_workspace must be contiguous with shape [batch]")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
@@ -870,8 +888,10 @@ def _triton_mha_decode_with_kvcache_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = (
+        prepare_mha_decode_workspace(cache_seqlens.shape[0], q.device)
+        if decode_workspace is None
+        else decode_workspace
     )
     decode_attention_fwd(
         q,

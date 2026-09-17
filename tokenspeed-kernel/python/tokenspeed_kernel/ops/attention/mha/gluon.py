@@ -78,7 +78,12 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_mha_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
+    def gluon_mha_decode_gfx950(
+        *args,
+        decode_workspace: torch.Tensor | None,
+        enable_pdl: bool = False,
+        **kwargs,
+    ):
         return _decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -112,7 +117,12 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_mha_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+    def gluon_mha_decode_gfx1250(
+        *args,
+        decode_workspace: torch.Tensor | None,
+        enable_pdl: bool = False,
+        **kwargs,
+    ):
         return _decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(

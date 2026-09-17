@@ -149,6 +149,18 @@ never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
 
+MHA's decode metadata also carries a read-only, kernel-prepared workspace view.
+The leaf allocates its backing tensor in `init_cuda_graph_state`, outside capture,
+with the same metadata-entry capacity as `seq_lens_buf`, including block-decode
+expansion and above-ladder eager batches. The kernel package owns its contents;
+the runtime only owns and slices the storage. The portable decode implementation
+uses it for constant split counts without changing the split policy or kernels;
+other implementations may ignore the hint. Refresh never writes this buffer.
+Initialization precedes execution on the existing startup stream, and graph
+owners must be released before rebinding drops the workspace and cached views.
+It is execution metadata, not request cache state or reusable scratch from the
+device-global workspace pool.
+
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
 but an earlier graph sharing the same private pool can overwrite its contents
