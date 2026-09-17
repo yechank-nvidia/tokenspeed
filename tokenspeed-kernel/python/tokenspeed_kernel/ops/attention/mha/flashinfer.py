@@ -237,6 +237,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
         enable_pdl: bool | None = None,
+        *,
+        decode_workspace: torch.Tensor | None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])

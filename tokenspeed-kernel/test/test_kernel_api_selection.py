@@ -1166,6 +1166,7 @@ def _attention_decode() -> object:
         cache_seqlens,
         max_seqlen_k=128,
         max_seqlen_q=1,
+        decode_workspace=None,
     )
 
 

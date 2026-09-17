@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
+    prepare_mha_decode_workspace,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -393,10 +394,12 @@ def test_mha_extend_with_kvcache(
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
 @pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
+@pytest.mark.parametrize("persistent_workspace", [False, True])
 def test_mha_decode_with_kvcache(
     device: str,
     solution: str,
     seqlen_q: int,
+    persistent_workspace: bool,
     dtype: torch.dtype,
     head_dim: int,
     num_q_heads: int,
@@ -497,6 +500,11 @@ def test_mha_decode_with_kvcache(
     page_table = page_table.to(device)
     cache_seqlens = cache_seqlens.to(device)
 
+    decode_workspace = (
+        prepare_mha_decode_workspace(batch_size, device)
+        if persistent_workspace
+        else None
+    )
     out = mha_decode_with_kvcache(
         q=q,
         k_cache=k_cache,
@@ -505,6 +513,7 @@ def test_mha_decode_with_kvcache(
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max_cache_seqlen,
         max_seqlen_q=seqlen_q,
+        decode_workspace=decode_workspace,
         solution=solution,
     )
 
@@ -512,6 +521,10 @@ def test_mha_decode_with_kvcache(
     assert not torch.isnan(out).any()
     expected_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
     assert out.dtype == expected_dtype
+    if decode_workspace is not None:
+        torch.testing.assert_close(
+            decode_workspace, torch.ones_like(decode_workspace), rtol=0, atol=0
+        )
     if expected_out is not None:
         tol = 3e-1 if dtype in _FP8_DTYPES else 3e-2
         torch.testing.assert_close(out.float().cpu(), expected_out, rtol=tol, atol=tol)
@@ -594,6 +607,7 @@ def test_mha_decode_with_kvcache_gluon_peeled_split(
         cache_seqlens=cache_seqlens.to(device),
         max_seqlen_k=max_seqlen_k,
         max_seqlen_q=1,
+        decode_workspace=None,
         solution="gluon",
     )
 
@@ -669,6 +683,7 @@ def test_fa4_mha_fp8_kvcache_matches_bf16_on_dequant_inputs(
         )
         run = mha_extend_with_kvcache
     else:
+        kwargs["decode_workspace"] = None
         run = mha_decode_with_kvcache
 
     out_fp8 = run(q=q8, k_cache=k8, v_cache=v8, **kwargs)
