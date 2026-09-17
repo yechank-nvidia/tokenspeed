@@ -35,6 +35,32 @@ import torch
 # a different parallelism. M per batch row is what the call site multiplies the
 # batch by: 1 for ordinary decode, the block width for a per-block shape.
 SHAPE_SETS = {
+    # 5120-hidden GQA decoder (48 query / 8 KV heads, head_dim 128, dense MLP
+    # width 20480) BF16 decode shapes observed at UnquantizedLinearMethod. The
+    # attention projections run once per layer of a 52-layer stack; the dense
+    # MLP shapes belong to its single dense layer.
+    "gqa48x8_h5120_tp8": (
+        [
+            (1024, 5120, 52, 1, "attn_qkv_proj"),
+            (768, 5120, 52, 1, "attn_gate_proj"),
+            (5120, 768, 52, 1, "attn_o_proj"),
+            (5120, 5120, 1, 1, "dense_gate_up_proj"),
+            (5120, 2560, 1, 1, "dense_down_proj"),
+        ],
+        # Small decode batches exactly, then the CUDA graph capture sizes the
+        # padded decode batch lands on.
+        [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32],
+    ),
+    "gqa48x8_h5120_tp4": (
+        [
+            (2048, 5120, 52, 1, "attn_qkv_proj"),
+            (1536, 5120, 52, 1, "attn_gate_proj"),
+            (5120, 1536, 52, 1, "attn_o_proj"),
+            (10240, 5120, 1, 1, "dense_gate_up_proj"),
+            (5120, 5120, 1, 1, "dense_down_proj"),
+        ],
+        list(range(1, 9)),
+    ),
     "k3_tp16": (
         [
             (3584, 7168, 92, 1, "n3584_k7168"),

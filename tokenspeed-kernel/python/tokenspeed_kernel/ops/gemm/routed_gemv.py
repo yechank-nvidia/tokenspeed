@@ -616,6 +616,90 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (32, 7168, 1024): "splitk",
         (16, 7168, 1792): "splitk",
         (32, 7168, 1792): "splitk",
+        # 5120-hidden GQA decoder (48 query / 8 KV heads, head_dim 128), TP4:
+        # gqa48x8_h5120_tp4 sweep on GB200, M 1-8. cuBLAS runs these K=5120
+        # projections as split-K pairs; ll_bf16 wins 1.10-1.45x.
+        # attn qkv_proj  N=2048 K=5120
+        (1, 2048, 5120): "ll_bf16",
+        (2, 2048, 5120): "ll_bf16",
+        (3, 2048, 5120): "ll_bf16",
+        (4, 2048, 5120): "ll_bf16",
+        (5, 2048, 5120): "ll_bf16",
+        (6, 2048, 5120): "ll_bf16",
+        (7, 2048, 5120): "ll_bf16",
+        (8, 2048, 5120): "ll_bf16",
+        # attn gate_proj  N=1536 K=5120
+        (1, 1536, 5120): "ll_bf16",
+        (2, 1536, 5120): "ll_bf16",
+        (3, 1536, 5120): "ll_bf16",
+        (4, 1536, 5120): "ll_bf16",
+        (5, 1536, 5120): "ll_bf16",
+        (6, 1536, 5120): "ll_bf16",
+        (7, 1536, 5120): "ll_bf16",
+        (8, 1536, 5120): "ll_bf16",
+        # attn o_proj  N=5120 K=1536
+        (1, 5120, 1536): "tgv",
+        (2, 5120, 1536): "tgv",
+        (3, 5120, 1536): "tgv",
+        (4, 5120, 1536): "tgv",
+        (8, 5120, 1536): "tgv",
+        # dense gate_up_proj  N=10240 K=5120
+        (1, 10240, 5120): "rowcta",  # 16.69 vs cuBLAS 19.69 us
+        (2, 10240, 5120): "skinny",
+        (3, 10240, 5120): "skinny",
+        # dense down_proj  N=5120 K=5120 (also the TP8 dense gate_up_proj)
+        (1, 5120, 5120): "rowcta",  # TP8 gate_up: 9.98 vs cuBLAS 11.76 us
+        (2, 5120, 5120): "tgv",
+        (3, 5120, 5120): "tgv",
+        (4, 5120, 5120): "tgv",
+        (5, 5120, 5120): "tgv",
+        (6, 5120, 5120): "tgv",
+        (7, 5120, 5120): "tgv",
+        (8, 5120, 5120): "tgv",
+        # Same decoder at TP8: gqa48x8_h5120_tp8 sweep on GB200 at M 1-8 and
+        # the graph capture sizes 12/16/24/32. cuBLAS keeps o_proj above M=4
+        # and the dense shapes above M=8.
+        # attn qkv_proj  N=1024 K=5120
+        (1, 1024, 5120): "rowcta",  # 2.44 vs cuBLAS 4.91 us
+        (2, 1024, 5120): "skinny",
+        (3, 1024, 5120): "ll_bf16",
+        (4, 1024, 5120): "ll_bf16",
+        (5, 1024, 5120): "ll_bf16",
+        (6, 1024, 5120): "ll_bf16",
+        (7, 1024, 5120): "ll_bf16",
+        (8, 1024, 5120): "ll_bf16",
+        (12, 1024, 5120): "ll_bf16",
+        (16, 1024, 5120): "ll_bf16",
+        (24, 1024, 5120): "ll_bf16",
+        (32, 1024, 5120): "ll_bf16",
+        # attn gate_proj  N=768 K=5120
+        (1, 768, 5120): "skinny",
+        (2, 768, 5120): "skinny",
+        (3, 768, 5120): "skinny",
+        (4, 768, 5120): "skinny",
+        (5, 768, 5120): "skinny",
+        (6, 768, 5120): "skinny",
+        (7, 768, 5120): "ll_bf16",
+        (8, 768, 5120): "ll_bf16",
+        (12, 768, 5120): "ll_bf16",
+        (16, 768, 5120): "ll_bf16",
+        (24, 768, 5120): "ll_bf16",
+        (32, 768, 5120): "ll_bf16",
+        # attn o_proj  N=5120 K=768
+        (1, 5120, 768): "tgv",
+        (2, 5120, 768): "tgv",
+        (3, 5120, 768): "tgv",
+        (4, 5120, 768): "tgv",
+        (7, 5120, 768): "tgv",
+        # dense down_proj  N=5120 K=2560
+        (1, 5120, 2560): "skinny",
+        (2, 5120, 2560): "skinny",
+        (3, 5120, 2560): "tgv",
+        (4, 5120, 2560): "tgv",
+        (5, 5120, 2560): "tgv",
+        (6, 5120, 2560): "tgv",
+        (7, 5120, 2560): "tgv",
+        (8, 5120, 2560): "tgv",
     }
 )
 
