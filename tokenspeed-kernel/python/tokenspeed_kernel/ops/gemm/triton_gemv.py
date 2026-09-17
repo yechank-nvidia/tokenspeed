@@ -27,6 +27,11 @@ skinny shapes by 13-14% (measured: 6288x7168 15.8us vs 18.1; 3584x7168
 10.2us vs 11.9) while staying ~10% off the pure read+sum ceiling.
 Deterministic by construction: one fixed-order reduction per output, no
 split-K phase.
+
+FP32 inputs take the same row-per-CTA shape: a single row through the full-row
+reduction, and 2 to 32 rows through one CTA per weight row that streams the
+weight once against every activation row, where the Torch FP32 path would run
+a SIMT GEMM plus a split-K reduction.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "triton_rowcta_gemv"]
+__all__ = ["decode_gemv", "triton_rowcta_gemm_fp32", "triton_rowcta_gemv"]
 
 
 @triton.jit
@@ -88,6 +93,36 @@ def _rowcta_gemv_kernel(x_ptr, w_ptr, out_ptr, K: tl.constexpr, BK: tl.constexpr
     n = tl.program_id(0).to(tl.int64)
     value = _row_dot(x_ptr, w_ptr + n * K, K, BK)
     tl.store(out_ptr + n, value.to(out_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _rowcta_multirow_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """One weight row against every activation row; ``BM`` pads ``M``."""
+    n = tl.program_id(0).to(tl.int64)
+    rows = tl.arange(0, BM)
+    row_mask = rows < M
+    acc = tl.zeros([BM, BK], tl.float32)
+    for kb in tl.static_range(0, K, BK):
+        offs = kb + tl.arange(0, BK)
+        col_mask = offs < K
+        wv = tl.load(w_ptr + n * K + offs, mask=col_mask, other=0.0).to(tl.float32)
+        xv = tl.load(
+            x_ptr + rows[:, None] * K + offs[None, :],
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += xv * wv[None, :]
+    values = tl.sum(acc, axis=1)
+    tl.store(out_ptr + rows * N + n, values.to(out_ptr.dtype.element_ty), mask=row_mask)
 
 
 @triton.jit
@@ -186,6 +221,67 @@ def triton_rowcta_gemv(
         BK=block_k,
         num_warps=8 if fp32 and block_k >= 4096 else 4,
         enable_fp_fusion=not fp32,
+    )
+    return out
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="triton_rowcta_gemm_fp32",
+    solution="triton",
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.float32),
+                weight=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={"m": frozenset(range(2, 33))},
+    priority=Priority.SPECIALIZED,
+)
+def triton_rowcta_gemm_fp32(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` for a few FP32 decode rows, one CTA per weight row.
+
+    The FP32 Torch path serves these shapes with a SIMT GEMM plus a split-K
+    reduction; a narrow FP32 projection such as an expert router is memory
+    bound on its weight, which this kernel streams once while the activation
+    rows stay cache resident. Products and the tiled accumulation stay FP32
+    without fused multiply-add, as for the single-row FP32 kernel.
+
+    Args:
+        x: ``[M, K]`` contiguous FP32 activations, ``2 <= M <= 32``.
+        weight: ``[N, K]`` contiguous FP32 weight.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` FP32 output.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    assert 2 <= m <= 32 and x.stride(-1) == 1 and weight.stride(-1) == 1
+    if out is None:
+        out = torch.empty(m, n, dtype=x.dtype, device=x.device)
+    if n == 0:
+        return out
+    if k == 0:
+        return out.zero_()
+    block_m = triton.next_power_of_2(m)
+    block_k = min(triton.next_power_of_2(k), 512)
+    _rowcta_multirow_kernel[(n,)](
+        x,
+        weight,
+        out,
+        M=m,
+        N=n,
+        K=k,
+        BM=block_m,
+        BK=block_k,
+        num_warps=8 if block_m >= 16 else 4,
+        enable_fp_fusion=False,
     )
     return out
 
