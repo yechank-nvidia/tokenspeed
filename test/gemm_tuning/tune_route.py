@@ -178,6 +178,20 @@ for n, k, calls, per_row, label in SHAPES:
                 f"{label:<18}{f'{n}x{k}':>12} {m:>2}  {cells}  {best:<8} "
                 f"{incumbent / ok[best]:5.2f}x"
             )
+        elif (
+            times.get("rowcta") == incumbent
+            and times.get("cublas") is not None
+            and incumbent * MARGIN <= times["cublas"]
+        ):
+            # rowcta is what decode_gemv already picks at M == 1, but linear
+            # layers only reach decode_gemv through the table; name it there
+            # where it beats the cuBLAS call they would otherwise make.
+            route[f"{m},{n},{k}"] = "rowcta"
+            per_step_gain[batch] += (times["cublas"] - incumbent) * calls
+            print(
+                f"{label:<18}{f'{n}x{k}':>12} {m:>2}  {cells}  {'rowcta':<8} "
+                f"{times['cublas'] / incumbent:5.2f}x"
+            )
         else:
             keep = "rowcta" if times.get("rowcta") == incumbent else "cublas"
             print(
