@@ -38,6 +38,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 
 import zmq
@@ -86,7 +87,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
-from tokenspeed.runtime.utils.process import kill_process_tree
+from tokenspeed.runtime.utils.process import kill_process_tree, stop_owned_processes
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from tokenspeed.version import __version__
@@ -513,6 +514,50 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _wait_for_follower_shutdown(server_args, readers, processes):
+    """Accept only requested, clean completion after all local ranks are ready."""
+    stop_requested = False
+    child_failed = False
+
+    def request_stop(signum, _frame):
+        nonlocal stop_requested, child_failed
+        if signum == signal.SIGUSR1:
+            child_failed = True
+        stop_requested = True
+
+    previous = {
+        sig: signal.getsignal(sig)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1)
+    }
+    try:
+        for sig in previous:
+            signal.signal(sig, request_stop)
+        for reader in readers:
+            while not reader.poll(0.05):
+                if stop_requested or any(p.exitcode is not None for p in processes):
+                    raise RuntimeError("follower startup interrupted or child exited")
+            if stop_requested or reader.recv().get("status") != "ready":
+                raise RuntimeError("follower initialization failed")
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
+        while not stop_requested:
+            if any(process.exitcode is not None for process in processes):
+                raise RuntimeError("follower child exited without a shutdown request")
+            time.sleep(0.05)
+        if child_failed:
+            raise RuntimeError("follower child reported a runtime failure")
+    finally:
+        try:
+            stop_owned_processes(processes, timeout_seconds=30.0)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+    if child_failed:
+        raise RuntimeError("follower child reported a cleanup failure")
+    return None, None, {"follower_shutdown_complete": True}
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -578,6 +623,11 @@ def _launch_subprocesses(
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
+        if envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
+            return _wait_for_follower_shutdown(
+                server_args, scheduler_pipe_readers, scheduler_procs
+            )
+
         for reader in scheduler_pipe_readers:
             data = reader.recv()
             if data.get("status") != "ready":
@@ -585,26 +635,13 @@ def _launch_subprocesses(
                     "Initialization failed. Please see the error messages above."
                 )
 
-        if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
-            # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None
-
-        launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
-        )
-
-        for proc in scheduler_procs:
-            proc.join()
-            logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
-            )
+        # Preserve the nonblocking Python Engine API contract.
         return None, None, None
 
     # Launch the main-process async frontend. The detokenizer runs
     # inline inside AsyncLLM — no separate subprocess.
     tokenizer_manager = AsyncLLM(server_args, port_args)
+    tokenizer_manager.scheduler_processes = tuple(scheduler_procs)
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -672,8 +709,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     scheduler_pipe_readers = []
 
     # SIGUSR1 is what a scheduler sends its parent on an internal exception
-    # (see run_event_loop) — the child itself then exits 0, so record the
-    # failure here or the supervisor would report success.
+    # (see run_event_loop). Record it as well as checking child exit codes,
+    # so the supervisor preserves a failure reported during shutdown.
     child_failed = threading.Event()
 
     def _terminate_schedulers(signum=None, _frame=None):

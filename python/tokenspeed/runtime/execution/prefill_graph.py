@@ -268,6 +268,14 @@ class PrefillGraph:
         self._captures: dict[int, BreakableCapture] = {}
         self._outputs: dict[int, CapturedForward] = {}
 
+    def close(self) -> None:
+        """Release captured prefill graphs after device synchronization."""
+        for capture in self._captures.values():
+            capture.close()
+        self._captures.clear()
+        self._outputs.clear()
+        self._pool = None
+
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------

@@ -27,6 +27,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import psutil
 
@@ -76,3 +77,51 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
+
+
+def stop_owned_processes(processes, *, timeout_seconds):
+    """Request TERM for all owned roots, reap, and fail on any forced/nonzero exit.
+
+    The existing hard-kill helper is reserved for deadline survivors;
+    requiring it remains a cleanup failure, even if the process is reaped.
+    """
+    if not 0 <= timeout_seconds < float("inf"):
+        raise ValueError("timeout_seconds must be nonnegative and finite")
+    deadline = time.monotonic() + timeout_seconds
+    errors = []
+    for process in processes:
+        if process.is_alive():
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                errors.append(f"TERM {process.pid}: {exc}")
+    for process in processes:
+        try:
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception as exc:
+            errors.append(f"join {process.pid}: {exc}")
+    survivors = [process for process in processes if process.is_alive()]
+    if survivors:
+        errors.append(
+            f"forced cleanup required: {[process.pid for process in survivors]}"
+        )
+        for process in survivors:
+            try:
+                kill_process_tree(process.pid, include_parent=True)
+            except Exception as exc:
+                errors.append(f"KILL {process.pid}: {exc}")
+        kill_deadline = time.monotonic() + 5.0
+        for process in survivors:
+            try:
+                process.join(timeout=max(0.0, kill_deadline - time.monotonic()))
+            except Exception as exc:
+                errors.append(f"forced join {process.pid}: {exc}")
+    for process in processes:
+        if process.is_alive() or process.exitcode != 0:
+            errors.append(
+                f"child {process.pid} not cleanly reaped: exit={process.exitcode}"
+            )
+    if errors:
+        raise RuntimeError("; ".join(errors))

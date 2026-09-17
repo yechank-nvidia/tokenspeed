@@ -354,6 +354,12 @@ class EncoderForwardStepRunner:
         encoder_outs = self._dispatch(batch)
         return self.adapter.postprocess(encoder_outs, batch)
 
+    def close(self) -> None:
+        """Reset owned encoder graphs after device synchronization."""
+        for metadata in self.budget_graphs.values():
+            metadata.graph.reset()
+        self.budget_graphs.clear()
+
     @staticmethod
     def _generate_budgets(min_budget: int, max_budget: int) -> list[int]:
         """Power-of-2 budgets in ``[min_budget, max_budget]``."""

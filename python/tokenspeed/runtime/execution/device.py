@@ -259,6 +259,17 @@ class DeviceHandle:
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
 
+    def close(self) -> None:
+        """Drain the FIFO and close device-owned graphs before group teardown."""
+        try:
+            self._thread.submit(self._executor.close).result(timeout=30)
+            _settle(self._l2_submissions, "Cache submission failed during shutdown")
+            _settle(
+                self._transfer_submissions, "Transfer submission failed during shutdown"
+            )
+        finally:
+            self._thread.shutdown()
+
     # ------------------------------------------------------------------
     # Per-round work
     # ------------------------------------------------------------------
