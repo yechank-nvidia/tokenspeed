@@ -229,6 +229,8 @@ if platform.is_nvidia and platform.is_blackwell:
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
         enable_pdl: bool = False,
+        *,
+        decode_workspace: torch.Tensor | None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -355,6 +357,8 @@ if platform.is_nvidia and platform.is_blackwell:
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
         enable_pdl: bool = False,
+        *,
+        decode_workspace: torch.Tensor | None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -434,6 +438,8 @@ if platform.is_nvidia and platform.is_blackwell:
             k_scale: torch.Tensor | None = None,
             v_scale: torch.Tensor | None = None,
             enable_pdl: bool = False,
+            *,
+            decode_workspace: torch.Tensor | None,
         ) -> torch.Tensor:
             if softmax_scale is None:
                 softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -695,6 +701,8 @@ elif platform.is_nvidia and platform.is_hopper:
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
         enable_pdl: bool = False,
+        *,
+        decode_workspace: torch.Tensor | None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])

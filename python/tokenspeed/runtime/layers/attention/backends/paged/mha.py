@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_extend_with_kvcache,
     mha_plan,
     mha_prefill,
+    prepare_mha_decode_workspace,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
@@ -111,6 +112,7 @@ class MHAExtendMetadata:
 class MHADecodeMetadata:
     page_table: torch.Tensor
     seq_lens: torch.Tensor
+    decode_workspace: torch.Tensor | None
 
 
 class MHAAttnBackend(PagedAttentionBackend):
@@ -156,11 +158,19 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+        self.decode_workspace_buf: torch.Tensor | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
+        self.decode_workspace_buf = None
+
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        super().init_cuda_graph_state(max_bs)
+        self.decode_workspace_buf = prepare_mha_decode_workspace(
+            max_batch_size=self.seq_lens_buf.shape[0], device=self.device
+        )
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -229,6 +239,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             metadata = MHADecodeMetadata(
                 page_table=self.page_table_buf[:expanded_bs],
                 seq_lens=self.seq_lens_buf[:expanded_bs],
+                decode_workspace=self.decode_workspace_buf[:expanded_bs],
             )
             self._decode_views_by_bs[bs] = metadata
         return metadata
@@ -310,6 +321,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             v_cache=v_cache,
             page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
+            decode_workspace=metadata.decode_workspace,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=kwargs.get("sinks"),

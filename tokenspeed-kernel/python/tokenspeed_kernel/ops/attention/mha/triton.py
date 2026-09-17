@@ -186,6 +186,8 @@ def triton_mha_decode_with_kvcache(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    *,
+    decode_workspace: torch.Tensor | None,
 ) -> torch.Tensor:
     return _triton_mha_decode_with_kvcache_impl(
         q=q,
@@ -193,6 +195,7 @@ def triton_mha_decode_with_kvcache(
         v_cache=v_cache,
         page_table=page_table,
         cache_seqlens=cache_seqlens,
+        decode_workspace=decode_workspace,
         max_seqlen_k=max_seqlen_k,
         max_seqlen_q=max_seqlen_q,
         window_left=window_left,
@@ -276,5 +279,7 @@ if current_platform().is_npu:
         },
         tags={"portability"},
     )
-    def torch_npu_mha_decode_with_kvcache(**kwargs):
+    def torch_npu_mha_decode_with_kvcache(
+        *, decode_workspace: torch.Tensor | None, **kwargs
+    ):
         return _mha_decode_with_kvcache(**kwargs)

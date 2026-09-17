@@ -758,6 +758,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         host.forward_decode_metadata = MHADecodeMetadata(
             page_table=torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda"),
             seq_lens=host.seq_lens_buf[:1],
+            decode_workspace=None,
         )
         frontier = torch.tensor([6], dtype=torch.int32, device="cuda")
 
