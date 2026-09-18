@@ -23,14 +23,106 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["argmax"]
+__all__ = ["argmax", "try_gather_token_logprobs"]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
+
+
+def _supports_selected_token_logprobs(
+    logits: torch.Tensor, tokens: torch.Tensor
+) -> bool:
+    """Inspect metadata only; never read indices or allocate/copy tensors."""
+    if (
+        not isinstance(logits, torch.Tensor)
+        or not isinstance(tokens, torch.Tensor)
+        or logits.layout != torch.strided
+        or tokens.layout != torch.strided
+        or not logits.is_cuda
+        or not tokens.is_cuda
+        or logits.device != tokens.device
+        or logits.dtype != torch.float32
+        or tokens.dtype != torch.int32
+        or logits.shape != (1, 151936)
+        or tokens.shape != (1,)
+        or logits.stride() != (151936, 1)
+        or tokens.stride() != (1,)
+        or logits.storage_offset() != 0
+        or tokens.storage_offset() != 0
+        or logits.requires_grad
+        or tokens.requires_grad
+        or logits.is_neg()
+        or logits.is_conj()
+        or tokens.is_neg()
+        or tokens.is_conj()
+        or torch.is_autocast_enabled("cuda")
+    ):
+        return False
+    platform = current_platform()
+    if (
+        not platform.is_nvidia
+        or (platform.arch_version.major, platform.arch_version.minor) != (10, 0)
+        or not pdl_enabled()
+        or logits.device.index != torch.cuda.current_device()
+    ):
+        return False
+    logits_ptr, tokens_ptr = logits.data_ptr(), tokens.data_ptr()
+    if logits_ptr <= 0 or tokens_ptr <= 0 or logits_ptr % 16 or tokens_ptr % 16:
+        return False
+    return not (logits_ptr < tokens_ptr + 4 and tokens_ptr < logits_ptr + 151936 * 4)
+
+
+def try_gather_token_logprobs(
+    logits: torch.Tensor, tokens: torch.Tensor
+) -> torch.Tensor | None:
+    """Try raw-distribution selected-token logprobs without sampling transforms.
+
+    Args:
+        logits: Raw logits, without temperature/top-k/top-p preprocessing.
+            The current specialization accepts FP32 [1, 151936] with exact
+            stride (151936, 1) on the current SM100 CUDA device.
+        tokens: Colocated INT32 [1] with stride (1,). Its index must be in
+            [0, 151936); this caller invariant is device-asserted, never read
+            on the host. Both inputs require zero storage offset, 16-byte
+            pointer alignment, disjoint storage, no lazy negation/conjugation,
+            no gradients, and no CUDA
+            autocast. The platform PDL setting must be enabled.
+
+    Returns:
+        A fresh FP32 [1] result, or None for unsupported metadata/selection.
+        None performs no tensor allocation, copy, synchronization or launch;
+        callers retain their existing reference/fallback operation. Admitted
+        calls allocate 8196 logical scratch bytes plus a separate fresh output,
+        retain no global/backend workspace, and read live inputs on replay.
+        Graphs own capture allocations; release graphs before their owners.
+        NaNs/infinities are not sanitized and all FP32 value bits are admitted.
+    """
+    if not _supports_selected_token_logprobs(logits, tokens):
+        return None
+    try:
+        # Registration is lazy so rejected/other-vendor inputs need no Triton.
+        import tokenspeed_kernel.ops.sampling.triton.ordered_logprobs  # noqa: F401
+    except ImportError:
+        return None
+    signature = format_signature(
+        logits=dense_tensor_format(logits.dtype),
+        tokens=dense_tensor_format(tokens.dtype),
+    )
+    try:
+        kernel = select_kernel(
+            "sampling",
+            "gather_token_logprobs",
+            signature,
+            traits={"rows": 1, "vocab_size": 151936},
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(logits, tokens)
 
 
 def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:

@@ -362,6 +362,15 @@ packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 Triton backends return separate token and length buffers and take the
 executor's two-copy path (`get_packed_output_d2h` returns None).
 
+Selected-token logprobs retain fresh per-call output ownership. The shared
+kernel package may admit an ordered reduction from tensor metadata; other
+inputs keep the original compiled Torch operation. Its temporary reduction
+storage is local to the call and follows ordinary eager/captured allocator
+lifetimes, never a persistent backend output or a capture-created tensor
+cached for eager reuse. Dispatch changes neither pool sampling nor grammar,
+acceptance, DP gathering or TP broadcast order. Capture/replay uses the same
+helper as eager execution and reads live logits and selected-token buffers.
+
 ## What stays graph-only
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics

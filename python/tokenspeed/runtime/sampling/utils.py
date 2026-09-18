@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling import try_gather_token_logprobs
 
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
@@ -67,6 +68,21 @@ def gather_token_logprobs_torch(
     """Return the selected token's log probability for each logits row."""
     raw_logprobs = torch.log_softmax(logits.float(), dim=-1)
     return raw_logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+
+
+def gather_token_logprobs(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Return fresh per-row selected logprobs, retaining the Torch fallback.
+
+    The kernel package admits supported metadata without changing logits or
+    token values. Unsupported inputs keep the original Torch operation.
+    """
+    result = try_gather_token_logprobs(logits, tokens)
+    if result is not None:
+        return result
+    return gather_token_logprobs_torch(logits, tokens)
 
 
 def top_p_normalize_probs_torch(
