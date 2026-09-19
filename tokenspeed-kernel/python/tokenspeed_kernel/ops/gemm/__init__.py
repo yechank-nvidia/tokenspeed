@@ -64,9 +64,6 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    triton_fp32_decode_gemv as fp32_decode_gemv,
-)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
@@ -98,7 +95,6 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
-    "fp32_decode_gemv",
     "quantize_fp8_group32_for_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",

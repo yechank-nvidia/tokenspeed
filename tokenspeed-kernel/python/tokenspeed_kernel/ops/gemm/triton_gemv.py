@@ -39,7 +39,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "triton_fp32_decode_gemv", "triton_rowcta_gemv"]
+__all__ = ["decode_gemv", "triton_rowcta_gemv"]
 
 
 @triton.jit
@@ -85,7 +85,7 @@ def _row_dot(x_ptr, w_ptr, K: tl.constexpr, BK: tl.constexpr):
 
 @triton.jit
 def _rowcta_gemv_kernel(x_ptr, w_ptr, out_ptr, K: tl.constexpr, BK: tl.constexpr):
-    n = tl.program_id(0)
+    n = tl.program_id(0).to(tl.int64)
     value = _row_dot(x_ptr, w_ptr + n * K, K, BK)
     tl.store(out_ptr + n, value.to(out_ptr.dtype.element_ty))
 
@@ -127,6 +127,22 @@ _BF16_SIG = frozenset(
 @register_kernel(
     "gemm",
     "decode_gemv",
+    name="triton_rowcta_gemv_fp32",
+    solution="triton",
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.float32),
+                weight=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={"m": frozenset({1})},
+    priority=Priority.SPECIALIZED,
+)
+@register_kernel(
+    "gemm",
+    "decode_gemv",
     name="triton_rowcta_gemv",
     solution="triton",
     signatures=_BF16_SIG,
@@ -143,8 +159,8 @@ def triton_rowcta_gemv(
     """``x @ weight.T`` for ``M == 1`` decode activations.
 
     Args:
-        x: ``[1, K]`` contiguous bf16 activation row.
-        weight: ``[N, K]`` contiguous bf16 weight.
+        x: ``[1, K]`` contiguous BF16 or FP32 activation row.
+        weight: ``[N, K]`` contiguous weight in the same dtype as ``x``.
         out: optional ``[1, N]`` destination.
 
     Returns:
@@ -154,14 +170,22 @@ def triton_rowcta_gemv(
     n, k = weight.shape
     if out is None:
         out = torch.empty(1, n, dtype=x.dtype, device=x.device)
-    # BK=512 (4 fp32 accumulator regs/thread): standalone parity, and aux-stream kernels co-reside instead of stalling behind the GEMV wave.
+    if n == 0:
+        return out
+    if k == 0:
+        return out.zero_()
+    # Keep BF16's tiled accumulation. FP32 uses a full-row reduction for
+    # ordinary projection widths, capping the tile for wider inputs.
+    fp32 = x.dtype == torch.float32
+    block_k = min(triton.next_power_of_2(k), 65536) if fp32 else 512
     _rowcta_gemv_kernel[(n,)](
         x.view(-1),
         weight,
         out.view(-1),
         K=k,
-        BK=512,
-        num_warps=4,
+        BK=block_k,
+        num_warps=8 if fp32 and block_k >= 4096 else 4,
+        enable_fp_fusion=not fp32,
     )
     return out
 
@@ -224,7 +248,7 @@ def torch_decode_gemv(
 
 
 @functools.lru_cache(maxsize=64)
-def _select(m: int, n: int, k: int, on_cuda: bool):
+def _select(m: int, n: int, k: int, on_cuda: bool, dtype: torch.dtype):
     if not on_cuda:
         return torch_decode_gemv
     from tokenspeed_kernel.platform import current_platform
@@ -239,7 +263,13 @@ def _select(m: int, n: int, k: int, on_cuda: bool):
     # it an arch-gated spec (the measured sm103 route) would match anywhere.
     traits = {"m": m, "n": n, "k": k}
     for spec in reg.get_for_operator(
-        "gemm", "decode_gemv", platform=current_platform()
+        "gemm",
+        "decode_gemv",
+        platform=current_platform(),
+        format_signature=format_signature(
+            x=dense_tensor_format(dtype),
+            weight=dense_tensor_format(dtype),
+        ),
     ):
         if spec_matches_traits(spec, traits) and spec_matches_shape_traits(
             spec, traits
@@ -255,9 +285,10 @@ def decode_gemv(
 ) -> torch.Tensor:
     """``x @ weight.T`` with registry-selected decode kernels.
 
-    Selection is cached per (M, N, K, device kind); the shape traits keep
+    Selection is cached per (M, N, K, device kind, dtype); the shape traits keep
     the specialized kernels inside their validated envelope and everything
-    else routes to the portable fallback.
+    else routes to the portable fallback. Contiguous single-row FP32 GPU inputs
+    use FP32 products and accumulation independently of Torch matmul precision.
     """
     expected = (x.shape[0], weight.shape[0])
     if out is not None:
@@ -270,7 +301,14 @@ def decode_gemv(
             raise ValueError(f"out must match x and have shape {expected}")
         if not out.is_contiguous():
             return torch_decode_gemv(x, weight, out)
-    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
+    if (
+        x.dtype != weight.dtype
+        or x.device != weight.device
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return torch_decode_gemv(x, weight, out)
+    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda, x.dtype)(
         x, weight, out
     )
 
@@ -356,111 +394,5 @@ def grouped_bf16_projection_rowcta(
         OUT_GROUP_STRIDE=out.stride(1),
         num_warps=4,
         enable_fp_fusion=False,
-    )
-    return out
-
-
-@triton.jit
-def _fp32_decode_gemv_kernel(
-    x_ptr,
-    weight_ptr,
-    out_ptr,
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """One FP32 weight row per CTA for bandwidth-bound decode projection."""
-    row = tl.program_id(0).to(tl.int64)
-    offsets = tl.arange(0, BLOCK_K)
-    mask = offsets < K
-
-    weight = tl.load(
-        weight_ptr + row * K + offsets,
-        mask=mask,
-        other=0.0,
-    )
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    tl.store(out_ptr + row, tl.sum(x * weight))
-
-
-@register_kernel(
-    "gemm",
-    "fp32_decode_gemv",
-    name="triton_fp32_decode_gemv",
-    solution="triton",
-    signatures=frozenset(
-        {
-            format_signature(
-                x=dense_tensor_format(torch.float32),
-                weight=dense_tensor_format(torch.float32),
-            )
-        }
-    ),
-    traits={"m": frozenset({1})},
-    priority=Priority.SPECIALIZED,
-)
-def triton_fp32_decode_gemv(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor | None,
-) -> torch.Tensor:
-    """Compute an FP32 ``x @ weight.T`` for a single decode row.
-
-    The kernel assigns one contiguous weight row to each CTA and performs a
-    fixed-order FP32 reduction. It is intended for memory-bound, large-output
-    projections. Multi-row inputs remain GEMM
-    workloads and should use :func:`torch.mm` instead.
-
-    Args:
-        x: Contiguous FP32 activation shaped ``[1, K]``, with ``1 <= K <= 65536``.
-        weight: Contiguous FP32 weight shaped ``[N, K]``.
-        out: Contiguous FP32 destination shaped ``[1, N]``, or ``None`` to
-            allocate one. Nonempty destinations must not share input storage.
-
-    Returns:
-        The FP32 output shaped ``[1, N]``.
-    """
-    if x.dim() != 2 or weight.dim() != 2:
-        raise ValueError("x and weight must be rank-2 tensors")
-    if x.shape[0] != 1 or x.shape[1] != weight.shape[1]:
-        raise ValueError(
-            "fp32_decode_gemv requires x shaped [1, K] and weight shaped [N, K]"
-        )
-    if x.dtype != torch.float32 or weight.dtype != torch.float32:
-        raise TypeError("fp32_decode_gemv requires FP32 x and weight")
-    if x.device != weight.device or not x.is_cuda:
-        raise ValueError("x and weight must be on the same GPU")
-    if not x.is_contiguous() or not weight.is_contiguous():
-        raise ValueError("x and weight must be contiguous")
-
-    n, k = weight.shape
-    if k == 0:
-        raise ValueError("K must be non-zero")
-    if k > 65536:
-        raise ValueError("K is too large for the row-CTA reduction")
-    if out is None:
-        out = torch.empty((1, n), device=x.device, dtype=torch.float32)
-    elif (
-        out.shape != (1, n)
-        or out.dtype != torch.float32
-        or out.device != x.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(f"out must be contiguous FP32 with shape {(1, n)}")
-    if n == 0:
-        return out
-    if out.untyped_storage().data_ptr() in {
-        x.untyped_storage().data_ptr(),
-        weight.untyped_storage().data_ptr(),
-    }:
-        raise ValueError("out must not alias x or weight storage")
-
-    block_k = triton.next_power_of_2(k)
-    _fp32_decode_gemv_kernel[(n,)](
-        x,
-        weight,
-        out,
-        K=k,
-        BLOCK_K=block_k,
-        num_warps=8 if block_k >= 4096 else 4,
     )
     return out

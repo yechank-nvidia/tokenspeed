@@ -1,35 +1,38 @@
 # GEMM and GEMV operations
 
-## Single-row FP32 GEMV
+## Dtype-aware decode GEMV
 
-`fp32_decode_gemv(x, weight, out)` computes `x @ weight.T` with a portable
-Triton kernel. Import it from `tokenspeed_kernel.ops.gemm` and pass `out`
-explicitly: `None` allocates an output, while a tensor reuses its storage.
+Use the existing `decode_gemv(x, weight, out)` dispatcher for `x @ weight.T`:
 
-- `x`: contiguous FP32 `[1, K]`, with `1 <= K <= 65536`.
-- `weight`: contiguous FP32 `[N, K]` on the same CUDA or ROCm device.
-- `out`: contiguous FP32 `[1, N]` on that device, or `None`.
-- The returned tensor has shape `[1, N]`. A supplied destination is returned
-  directly. `N = 0` returns an empty tensor without launching a kernel.
-- Nonempty destinations must not share storage with either input, including
-  disjoint views of the same allocation. Inputs may have contiguous storage
-  offsets.
+```python
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
-One thread block reduces each weight row in FP32. Masked loads handle widths
-that are not powers of two. The reduction order is fixed for a given launch,
-but can differ from a BLAS reduction, so comparisons use floating-point
-tolerances rather than require identical output bits. Weight row addresses
-use 64-bit arithmetic.
+result = decode_gemv(x, weight, None)
+```
 
-The implementation is registered as `triton_fp32_decode_gemv` under
-`gemm.fp32_decode_gemv`. It is an explicit single-row API; callers of the
-existing matrix-multiplication APIs keep their current dispatch.
+Contiguous single-row FP32 GPU inputs reuse the BF16 row-CTA implementation.
+The input is `[1, K]`, the weight is `[N, K]`, and both have matching dtype and
+device. Pass `None` to allocate `[1, N]`, or supply a destination with that
+shape, matching dtype/device and contiguous storage. Keep destination storage
+separate from inputs; the general dispatcher does not diagnose storage aliasing.
+Contiguous inputs and destinations may have nonzero storage offsets.
 
-Warm up the same shapes before CUDA Graph capture. Both destination modes
-support capture and replay, including updates to the input tensors.
+Selection is cached by shape, device kind and dtype, and registry lookup
+filters both input signatures. FP32 products and accumulation do not inherit
+Torch's reduced-precision matmul setting. FP32 uses a full-row reduction up to
+65536 elements and tiled accumulation above that width; BF16 retains its
+existing tile configuration. `N = 0` returns without launching a kernel and
+`K = 0` produces zeros. Row addresses use 64-bit arithmetic.
 
-Run correctness, validation, registration and graph tests with:
+Other row counts, unsupported signatures and noncontiguous inputs retain the
+existing Torch fallback and its matmul semantics. The standalone
+`fp32_decode_gemv` API/registration is removed in favor of this shared entry.
+Compare against a floating-point reference with tolerance: a fixed reduction
+order need not match a BLAS reduction bitwise.
+
+Warm up shapes before CUDA Graph capture. Replay reads live inputs, and callers
+own any supplied output buffer. Run shared dispatch, numerical and graph tests:
 
 ```bash
-python -m pytest tokenspeed-kernel/test/ops/gemm/test_fp32_decode_gemv.py -q
+python -m pytest tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py -q
 ```
