@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm
+from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm, staged_qk_rmsnorm_ssmax
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope,
     fused_qk_rmsnorm_rope_gate,
@@ -579,3 +579,88 @@ def test_fused_qk_rmsnorm_rope_non_contiguous_input(
 
     torch.testing.assert_close(q_fused, q_contig_fused, atol=0, rtol=0)
     torch.testing.assert_close(k_fused, k_contig_fused, atol=0, rtol=0)
+
+
+def _ref_staged_rmsnorm(x, weight, eps, staged_bf16):
+    x_f = x.float()
+    normalized = x_f * torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps)
+    if staged_bf16:
+        normalized = normalized.bfloat16().float()
+        weight = weight.bfloat16()
+    return (normalized * weight.float()).to(x.dtype)
+
+
+@pytest.mark.parametrize(
+    "tokens,q_heads,k_heads,dim,strided,preallocated",
+    [
+        (0, 3, 2, 128, False, False),
+        (1, 3, 2, 128, False, True),
+        (7, 5, 3, 96, True, False),
+        (129, 3, 5, 31, True, True),
+        (3, 2, 1, 1024, False, False),
+    ],
+)
+def test_staged_qk_ssmax(tokens, q_heads, k_heads, dim, strided, preallocated, device):
+    packed = torch.randn(
+        tokens + 1, (q_heads + k_heads + 1) * dim, dtype=torch.bfloat16, device=device
+    )
+    q = packed[1:, : q_heads * dim]
+    k = packed[1:, q_heads * dim : (q_heads + k_heads) * dim]
+    if not strided:
+        q, k = q.contiguous(), k.contiguous()
+    qw = torch.randn(dim, device=device).bfloat16()
+    kw = torch.randn(dim, device=device)
+    positions = torch.arange(
+        tokens, device=device, dtype=torch.int64 if strided else torch.int32
+    )
+    table = torch.linspace(-1.25, 2.25, max(2, tokens), device=device)
+    if tokens >= 3:
+        positions[0], positions[-1] = -1, table.numel()
+    out = (torch.empty_like(q), torch.empty_like(k)) if preallocated else None
+    result = staged_qk_rmsnorm_ssmax(q, k, qw, kw, positions, table, 1e-6, out)
+    if out is not None:
+        assert result is out
+    q_ref = _ref_staged_rmsnorm(q.reshape(tokens, q_heads, dim), qw, 1e-6, True)
+    k_ref = _ref_staged_rmsnorm(k.reshape(tokens, k_heads, dim), kw, 1e-6, True)
+    valid = (positions >= 0) & (positions < table.numel())
+    scale = torch.where(
+        valid, table[positions.long().clamp(0, table.numel() - 1)], float("nan")
+    )
+    q_ref = (q_ref.float() * scale[:, None, None]).bfloat16().reshape_as(q)
+    torch.testing.assert_close(result[0], q_ref, atol=0.016, rtol=0.008, equal_nan=True)
+    torch.testing.assert_close(result[1], k_ref.reshape_as(k), atol=0.016, rtol=0.008)
+
+
+def test_staged_qk_ssmax_rounding_and_graph_replay(device):
+    # Exact mean squares isolate BF16 boundaries from reduction order.
+    q = torch.ones((3, 256), device=device, dtype=torch.bfloat16)
+    q[:, 1::2] = 3.0
+    k = torch.full((3, 128), -1.0, device=device, dtype=torch.bfloat16)
+    qw = torch.linspace(0.8, 1.2, 128, device=device)
+    kw = qw.flip(0).contiguous()
+    positions = torch.tensor([2, 0, 1], device=device, dtype=torch.int64)
+    table = torch.tensor([0.0, -1.25, 1.003], device=device)
+    out = (torch.empty_like(q), torch.empty_like(k))
+    staged_qk_rmsnorm_ssmax(q, k, qw, kw, positions, table, 1e-6, out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        staged_qk_rmsnorm_ssmax(q, k, qw, kw, positions, table, 1e-6, out)
+    for position in (0, 2):
+        q.mul_(0.5)
+        k.neg_()
+        qw.add_(0.015625)
+        kw.sub_(0.0078125)
+        positions.fill_(position)
+        table.mul_(-0.9)
+        graph.replay()
+        q_ref = _ref_staged_rmsnorm(q.reshape(3, 2, 128), qw, 1e-6, True).reshape_as(q)
+        k_ref = _ref_staged_rmsnorm(k, kw, 1e-6, True)
+        q_ref = (q_ref.float() * table[positions, None]).bfloat16()
+        torch.testing.assert_close(out[0], q_ref, atol=0, rtol=0)
+        torch.testing.assert_close(out[1], k_ref, atol=0, rtol=0)
+    ordinary = qk_rmsnorm(q, k, qw, kw, 1e-6, False)
+    ordinary = ((ordinary[0].float() * table[positions, None]).bfloat16(), ordinary[1])
+    assert any(not torch.equal(a, b) for a, b in zip(out, ordinary))
+    with pytest.raises(ValueError, match="separate"):
+        staged_qk_rmsnorm_ssmax(q, k, qw, kw, positions, table, 1e-6, (q, k))

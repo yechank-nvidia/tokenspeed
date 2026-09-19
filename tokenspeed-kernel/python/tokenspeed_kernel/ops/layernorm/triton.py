@@ -337,6 +337,8 @@ def _fused_qk_rmsnorm_kernel(
     k_out_ptr,
     q_weight_ptr,
     k_weight_ptr,
+    positions_ptr,
+    scale_table_ptr,
     q_in_token_stride,
     k_in_token_stride,
     q_out_token_stride,
@@ -347,49 +349,59 @@ def _fused_qk_rmsnorm_kernel(
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    STAGED: tl.constexpr,
+    TABLE_SIZE: tl.constexpr,
+    HEADS_PER_CTA: tl.constexpr,
 ):
-    # 2D grid: (token, head). Heads in [0, num_q_heads) handle q rows;
-    # heads in [num_q_heads, num_q_heads + num_kv_heads) handle k rows.
-    # Inputs may be non-contiguous along the leading axis (e.g. views from a
-    # qkv split) — we use the explicit token strides to compute addresses.
-    token = tl.program_id(0)
-    head = tl.program_id(1)
+    groups = tl.cdiv(num_q_heads + num_kv_heads, HEADS_PER_CTA)
+    row = tl.program_id(0).to(tl.int64)
+    token = row // groups
+    head = row % groups * HEADS_PER_CTA + tl.arange(0, HEADS_PER_CTA)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
-
+    valid = head < num_q_heads + num_kv_heads
     offsets = tl.arange(0, BLOCK)
-    mask = offsets < head_dim
+    q_mask = (valid & ~is_k)[:, None] & (offsets < head_dim)[None, :]
+    k_mask = (valid & is_k)[:, None] & (offsets < head_dim)[None, :]
+    addresses = local_head[:, None] * head_dim + offsets[None, :]
 
-    if is_k:
-        in_addrs = (
-            k_in_ptr + token * k_in_token_stride + local_head * head_dim + offsets
-        )
-        out_addrs = (
-            k_out_ptr + token * k_out_token_stride + local_head * head_dim + offsets
-        )
-        w_addrs = k_weight_ptr + offsets
-    else:
-        in_addrs = (
-            q_in_ptr + token * q_in_token_stride + local_head * head_dim + offsets
-        )
-        out_addrs = (
-            q_out_ptr + token * q_out_token_stride + local_head * head_dim + offsets
-        )
-        w_addrs = q_weight_ptr + offsets
-
-    # Weights are parameters nothing in the decode graph writes; safe to load before the PDL wait.
-    w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
-
+    # Parameters are immutable and may be read before the producer wait.
+    qw = tl.load(q_weight_ptr + offsets, mask=offsets < head_dim, other=0.0).to(
+        tl.float32
+    )
+    kw = tl.load(k_weight_ptr + offsets, mask=offsets < head_dim, other=0.0).to(
+        tl.float32
+    )
+    weight = tl.where(is_k[:, None], kw[None, :], qw[None, :])
     if ENABLE_PDL:
-        # Wait for the producer's stores before the first dependent load.
         tl.extra.cuda.gdc_wait()
-
-    x = tl.load(in_addrs, mask=mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / head_dim
-    x = x * tl.rsqrt(var + eps)
-    tl.store(out_addrs, x * w, mask=mask)
+    q = tl.load(
+        q_in_ptr + token * q_in_token_stride + addresses, mask=q_mask, other=0.0
+    )
+    k = tl.load(
+        k_in_ptr + token * k_in_token_stride + addresses, mask=k_mask, other=0.0
+    )
+    x = tl.where(is_k[:, None], k, q).to(tl.float32)
+    variance = tl.sum(x * x, axis=1) / head_dim
+    x *= tl.rsqrt(variance[:, None] + eps)
+    if STAGED:
+        # Preserve separate BF16 normalization and affine stores.
+        x = x.to(tl.bfloat16).to(tl.float32)
+        weight = weight.to(tl.bfloat16).to(tl.float32)
+        output = (x * weight).to(tl.bfloat16).to(tl.float32)
+    else:
+        output = x * weight
+    if scale_table_ptr is not None:
+        position = tl.load(positions_ptr + token).to(tl.int64)
+        scale = tl.load(
+            scale_table_ptr + position,
+            mask=(position >= 0) & (position < TABLE_SIZE),
+            other=float("nan"),
+        )
+        output = tl.where(is_k[:, None], output, output * scale)
+    tl.store(q_out_ptr + token * q_out_token_stride + addresses, output, mask=q_mask)
+    tl.store(k_out_ptr + token * k_out_token_stride + addresses, output, mask=k_mask)
     if ENABLE_PDL:
-        # All stores issued; let the dependent kernel begin its prologue.
         tl.extra.cuda.gdc_launch_dependents()
 
 
@@ -434,13 +446,15 @@ def qk_rmsnorm(
     kwargs = {}
     if current_platform().is_nvidia:
         kwargs["launch_pdl"] = enable_pdl
-    _fused_qk_rmsnorm_kernel[(n_tokens, num_q_heads + num_kv_heads)](
+    _fused_qk_rmsnorm_kernel[(n_tokens * (num_q_heads + num_kv_heads),)](
         q,
         k,
         q_out,
         k_out,
         q_weight,
         k_weight,
+        None,
+        None,
         q_in_stride,
         k_in_stride,
         q_out.stride(0),
@@ -451,73 +465,12 @@ def qk_rmsnorm(
         eps,
         BLOCK=block,
         ENABLE_PDL=enable_pdl,
+        STAGED=False,
+        TABLE_SIZE=0,
+        HEADS_PER_CTA=1,
         **kwargs,
     )
     return q_out, k_out
-
-
-@triton.jit
-def _staged_qk_rmsnorm_ssmax_kernel(
-    q_ptr,
-    k_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    positions_ptr,
-    scale_table_ptr,
-    Q_STRIDE: tl.constexpr,
-    K_STRIDE: tl.constexpr,
-    Q_HEADS: tl.constexpr,
-    K_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    TABLE_SIZE: tl.constexpr,
-    EPS: tl.constexpr,
-    BLOCK: tl.constexpr,
-    HEADS_PER_CTA: tl.constexpr,
-):
-    groups = tl.cdiv(Q_HEADS + K_HEADS, HEADS_PER_CTA)
-    program = tl.program_id(0).to(tl.int64)
-    token = program // groups
-    head = (program % groups) * HEADS_PER_CTA + tl.arange(0, HEADS_PER_CTA)
-    dimension = tl.arange(0, BLOCK)
-    is_k = head >= Q_HEADS
-    local_head = tl.where(is_k, head - Q_HEADS, head)
-    valid = head < Q_HEADS + K_HEADS
-    q_mask = (valid & ~is_k)[:, None] & (dimension < HEAD_DIM)[None, :]
-    k_mask = (valid & is_k)[:, None] & (dimension < HEAD_DIM)[None, :]
-    q = tl.load(
-        q_ptr + token * Q_STRIDE + local_head[:, None] * HEAD_DIM + dimension[None, :],
-        mask=q_mask,
-        other=0.0,
-    )
-    k = tl.load(
-        k_ptr + token * K_STRIDE + local_head[:, None] * HEAD_DIM + dimension[None, :],
-        mask=k_mask,
-        other=0.0,
-    )
-    x = tl.where(is_k[:, None], k, q).to(tl.float32)
-    q_weight = tl.load(q_weight_ptr + dimension, mask=dimension < HEAD_DIM, other=0.0)
-    k_weight = tl.load(k_weight_ptr + dimension, mask=dimension < HEAD_DIM, other=0.0)
-    weight = tl.where(is_k[:, None], k_weight[None, :], q_weight[None, :])
-    weight = weight.to(tl.bfloat16).to(tl.float32)
-    variance = tl.sum(x * x, axis=1) / HEAD_DIM
-    normalized = (x * tl.rsqrt(variance[:, None] + EPS)).to(tl.bfloat16)
-    affine = (normalized.to(tl.float32) * weight).to(tl.bfloat16)
-
-    position = tl.load(positions_ptr + token).to(tl.int64)
-    valid_position = (position >= 0) & (position < TABLE_SIZE)
-    safe_position = tl.where(valid_position, position, 0)
-    scale = tl.load(
-        scale_table_ptr + safe_position, mask=valid_position, other=float("nan")
-    )
-    output = tl.where(
-        is_k[:, None], affine.to(tl.float32), affine.to(tl.float32) * scale
-    )
-    q_base = token * Q_HEADS * HEAD_DIM + local_head[:, None] * HEAD_DIM
-    k_base = token * K_HEADS * HEAD_DIM + local_head[:, None] * HEAD_DIM
-    tl.store(q_out_ptr + q_base + dimension[None, :], output, mask=q_mask)
-    tl.store(k_out_ptr + k_base + dimension[None, :], output, mask=k_mask)
 
 
 @register_kernel(
@@ -639,10 +592,7 @@ def triton_staged_qk_rmsnorm_ssmax(
         storage.add(pointer)
 
     q_heads, k_heads = q.shape[1] // head_dim, k.shape[1] // head_dim
-    heads_per_cta = 4
-    _staged_qk_rmsnorm_ssmax_kernel[
-        (tokens * triton.cdiv(q_heads + k_heads, heads_per_cta),)
-    ](
+    _fused_qk_rmsnorm_kernel[(tokens * triton.cdiv(q_heads + k_heads, 4),)](
         q,
         k,
         out[0],
@@ -651,15 +601,19 @@ def triton_staged_qk_rmsnorm_ssmax(
         k_weight,
         positions,
         scale_table,
-        Q_STRIDE=q.stride(0),
-        K_STRIDE=k.stride(0),
-        Q_HEADS=q_heads,
-        K_HEADS=k_heads,
-        HEAD_DIM=head_dim,
-        TABLE_SIZE=scale_table.numel(),
-        EPS=eps,
+        q.stride(0),
+        k.stride(0),
+        out[0].stride(0),
+        out[1].stride(0),
+        q_heads,
+        k_heads,
+        head_dim,
+        eps,
         BLOCK=triton.next_power_of_2(head_dim),
-        HEADS_PER_CTA=heads_per_cta,
+        ENABLE_PDL=False,
+        STAGED=True,
+        TABLE_SIZE=scale_table.numel(),
+        HEADS_PER_CTA=4,
         num_warps=4,
         enable_fp_fusion=False,
     )
