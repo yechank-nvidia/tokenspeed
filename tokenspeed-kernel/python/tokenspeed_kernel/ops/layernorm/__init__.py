@@ -27,9 +27,6 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
-from tokenspeed_kernel.ops.layernorm.triton import (
-    triton_staged_qk_rmsnorm_rope as staged_qk_rmsnorm_rope,
-)
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -159,10 +156,4 @@ def grouped_rmsnorm(
     return _grouped_rmsnorm(x, int(group_size), eps, out=out)
 
 
-__all__ = [
-    "grouped_gemma_rmsnorm",
-    "grouped_rmsnorm",
-    "qk_rmsnorm",
-    "rmsnorm",
-    "staged_qk_rmsnorm_rope",
-]
+__all__ = ["grouped_gemma_rmsnorm", "grouped_rmsnorm", "qk_rmsnorm", "rmsnorm"]

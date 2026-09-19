@@ -1,231 +1,8 @@
 from __future__ import annotations
 
-import math
-
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-
-
-@triton.jit
-def _staged_qk_rmsnorm_rope_kernel(
-    q_ptr,
-    k_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_ptr,
-    sin_ptr,
-    Q_STRIDE: tl.constexpr,
-    K_STRIDE: tl.constexpr,
-    COS_STRIDE: tl.constexpr,
-    SIN_STRIDE: tl.constexpr,
-    Q_HEADS: tl.constexpr,
-    K_HEADS: tl.constexpr,
-    EPS: tl.constexpr,
-    HEADS_PER_CTA: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1) * HEADS_PER_CTA + tl.arange(0, HEADS_PER_CTA)
-    dimension = tl.arange(0, 128)
-    half = tl.arange(0, 64)
-    is_k = head >= Q_HEADS
-    local_head = tl.where(is_k, head - Q_HEADS, head).to(tl.int64)
-    valid = head < Q_HEADS + K_HEADS
-    q_mask = (valid & ~is_k)[:, None]
-    k_mask = (valid & is_k)[:, None]
-    q = tl.load(
-        q_ptr + token * Q_STRIDE + local_head[:, None] * 128 + dimension[None, :],
-        mask=q_mask,
-        other=0.0,
-    )
-    k = tl.load(
-        k_ptr + token * K_STRIDE + local_head[:, None] * 128 + dimension[None, :],
-        mask=k_mask,
-        other=0.0,
-    )
-    x = tl.where(is_k[:, None], k, q).to(tl.float32)
-    q_weight = tl.load(q_weight_ptr + dimension).to(tl.bfloat16)[None, :]
-    k_weight = tl.load(k_weight_ptr + dimension).to(tl.bfloat16)[None, :]
-    weight = tl.where(is_k[:, None], k_weight, q_weight).to(tl.float32)
-    variance = tl.sum(x * x, axis=1) / 128.0
-    normalized = (x * tl.rsqrt(variance[:, None] + EPS)).to(tl.bfloat16)
-    affine = (normalized.to(tl.float32) * weight).to(tl.bfloat16)
-    pairs = affine.reshape((HEADS_PER_CTA, 2, 64)).permute((0, 2, 1))
-    first_half, second_half = tl.split(pairs)
-    first_half = first_half.to(tl.float32)
-    second_half = second_half.to(tl.float32)
-
-    cos1 = (
-        tl.load(cos_ptr + token * COS_STRIDE + half)
-        .to(tl.bfloat16)
-        .to(tl.float32)[None, :]
-    )
-    cos2 = (
-        tl.load(cos_ptr + token * COS_STRIDE + 64 + half)
-        .to(tl.bfloat16)
-        .to(tl.float32)[None, :]
-    )
-    sin1 = (
-        tl.load(sin_ptr + token * SIN_STRIDE + half)
-        .to(tl.bfloat16)
-        .to(tl.float32)[None, :]
-    )
-    sin2 = (
-        tl.load(sin_ptr + token * SIN_STRIDE + 64 + half)
-        .to(tl.bfloat16)
-        .to(tl.float32)[None, :]
-    )
-    first_product = (first_half * cos1).to(tl.bfloat16).to(tl.float32)
-    first_rotated = (second_half * sin1).to(tl.bfloat16).to(tl.float32)
-    second_product = (second_half * cos2).to(tl.bfloat16).to(tl.float32)
-    second_rotated = (first_half * sin2).to(tl.bfloat16).to(tl.float32)
-    first = (first_product - first_rotated).to(tl.bfloat16)
-    second = (second_product + second_rotated).to(tl.bfloat16)
-
-    q_base = token * Q_HEADS * 128 + local_head[:, None] * 128
-    k_base = token * K_HEADS * 128 + local_head[:, None] * 128
-    tl.store(q_out_ptr + q_base + half[None, :], first, mask=q_mask)
-    tl.store(q_out_ptr + q_base + 64 + half[None, :], second, mask=q_mask)
-    tl.store(k_out_ptr + k_base + half[None, :], first, mask=k_mask)
-    tl.store(k_out_ptr + k_base + 64 + half[None, :], second, mask=k_mask)
-
-
-@register_kernel(
-    "layernorm",
-    "staged_qk_rmsnorm_rope",
-    name="triton_staged_qk_rmsnorm_rope",
-    solution="triton",
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                k=dense_tensor_format(torch.bfloat16),
-            )
-        }
-    ),
-    traits={"head_dim": frozenset({128})},
-    priority=Priority.SPECIALIZED,
-)
-def triton_staged_qk_rmsnorm_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    eps: float,
-    out: tuple[torch.Tensor, torch.Tensor] | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Q/K RMSNorm and full NeoX RoPE with staged BF16 rounding.
-
-    Round weights and rotary factors to BF16, then preserve BF16 boundaries
-    after normalization, affine multiplication, each rotary product, and the
-    final rotary sum. Mean squares are reduced in FP32. All tensors must
-    share one CUDA or ROCm device.
-
-    Args:
-        q: BF16 queries shaped ``[T, QH * 128]``, with a contiguous last axis.
-        k: BF16 keys shaped ``[T, KH * 128]``, with a contiguous last axis.
-        q_weight: Contiguous BF16 or FP32 vector shaped ``[128]``.
-        k_weight: Contiguous BF16 or FP32 vector shaped ``[128]``.
-        cos: BF16 or FP32 cosine factors shaped ``[T, 128]``.
-        sin: BF16 or FP32 sine factors shaped ``[T, 128]``. Both factor
-            tensors support token strides and require a contiguous last axis.
-        eps: Finite, strictly positive RMSNorm epsilon.
-        out: Pair of contiguous BF16 destinations matching Q/K, or ``None``
-            to allocate them. Nonempty destinations must have separate
-            storage from every input and from each other.
-
-    Returns:
-        Contiguous BF16 ``(q_out, k_out)`` matching the input shapes. A supplied
-        pair is returned directly. Empty token batches launch no kernel.
-    """
-    if q.dim() != 2 or k.dim() != 2 or q.shape[0] != k.shape[0]:
-        raise ValueError("q and k must be rank 2 with matching token counts")
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
-        raise TypeError("q and k must have BF16 dtype")
-    if not q.is_cuda or any(
-        t.device != q.device for t in (k, q_weight, k_weight, cos, sin)
-    ):
-        raise ValueError("all inputs must share one GPU")
-    if q.stride(-1) != 1 or k.stride(-1) != 1:
-        raise ValueError("q and k require a contiguous last axis")
-    if any(t.shape[1] == 0 or t.shape[1] % 128 != 0 for t in (q, k)):
-        raise ValueError("q and k widths must be positive multiples of 128")
-    for weight in (q_weight, k_weight):
-        if weight.shape != (128,) or not weight.is_contiguous():
-            raise ValueError("weights must be contiguous vectors of length 128")
-        if weight.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError("weights must have BF16 or FP32 dtype")
-    tokens = q.shape[0]
-    for factor in (cos, sin):
-        if factor.shape != (tokens, 128) or factor.stride(-1) != 1:
-            raise ValueError(
-                "cos and sin require shape [T, 128] and a contiguous last axis"
-            )
-        if factor.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError("cos and sin must have BF16 or FP32 dtype")
-    if not math.isfinite(eps) or eps <= 0.0:
-        raise ValueError("eps must be finite and positive")
-
-    if out is None:
-        out = (
-            torch.empty(q.shape, dtype=q.dtype, device=q.device),
-            torch.empty(k.shape, dtype=k.dtype, device=k.device),
-        )
-    elif not isinstance(out, tuple) or len(out) != 2:
-        raise ValueError("out must be a pair of output tensors or None")
-    for destination, source in zip(out, (q, k)):
-        if (
-            not isinstance(destination, torch.Tensor)
-            or destination.shape != source.shape
-            or destination.dtype != source.dtype
-            or destination.device != source.device
-            or not destination.is_contiguous()
-        ):
-            raise ValueError("outputs must be contiguous BF16 tensors matching q and k")
-    if tokens == 0:
-        return out
-    storage = {
-        t.untyped_storage().data_ptr() for t in (q, k, q_weight, k_weight, cos, sin)
-    }
-    for destination in out:
-        pointer = destination.untyped_storage().data_ptr()
-        if pointer in storage:
-            raise ValueError(
-                "output storage must be separate from inputs and other outputs"
-            )
-        storage.add(pointer)
-
-    q_heads, k_heads = q.shape[1] // 128, k.shape[1] // 128
-    heads_per_cta = 8
-    _staged_qk_rmsnorm_rope_kernel[
-        (tokens, triton.cdiv(q_heads + k_heads, heads_per_cta))
-    ](
-        q,
-        k,
-        out[0],
-        out[1],
-        q_weight,
-        k_weight,
-        cos,
-        sin,
-        Q_STRIDE=q.stride(0),
-        K_STRIDE=k.stride(0),
-        COS_STRIDE=cos.stride(0),
-        SIN_STRIDE=sin.stride(0),
-        Q_HEADS=q_heads,
-        K_HEADS=k_heads,
-        EPS=eps,
-        HEADS_PER_CTA=heads_per_cta,
-        num_warps=heads_per_cta,
-        enable_fp_fusion=False,
-    )
-    return out
 
 
 @triton.jit
@@ -962,35 +739,54 @@ def _fused_qk_rmsnorm_rope_kernel(
     eps: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
+    STAGED_BF16: tl.constexpr,
+    HEADS_PER_CTA: tl.constexpr,
 ):
     """Fused per-head QK-RMSNorm + full RoPE kernel (no gate, rotary_dim == head_dim)."""
-    token = tl.program_id(0)
-    head = tl.program_id(1)
+    groups = tl.cdiv(num_q_heads + num_kv_heads, HEADS_PER_CTA)
+    row = tl.program_id(0).to(tl.int64)
+    token = row // groups
+    head = row % groups * HEADS_PER_CTA + tl.arange(0, HEADS_PER_CTA)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
-
-    if is_k:
-        in_base = k_ptr + token * k_stride_t + local_head * head_dim
-        w_ptr = k_weight_ptr
-        out_base = k_out_ptr + token * k_out_stride_t + local_head * head_dim
-    else:
-        in_base = q_ptr + token * q_stride_t + local_head * head_dim
-        w_ptr = q_weight_ptr
-        out_base = q_out_ptr + token * q_out_stride_t + local_head * head_dim
-
-    # --- RMSNorm over the full head_dim ---
-    # Load both halves for the variance computation.
+    valid = head < num_q_heads + num_kv_heads
     offs = tl.arange(0, HALF_BLOCK)
     mask = offs < half_dim
-    x1 = tl.load(in_base + offs, mask=mask, other=0.0).to(tl.float32)
-    x2 = tl.load(in_base + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
-    var = (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / head_dim
-    inv_rms = tl.rsqrt(var + eps)
+    q_mask = (valid & ~is_k)[:, None] & mask[None, :]
+    k_mask = (valid & is_k)[:, None] & mask[None, :]
+    offsets = local_head[:, None] * head_dim + offs[None, :]
+    q_base = q_ptr + token * q_stride_t + offsets
+    k_base = k_ptr + token * k_stride_t + offsets
+    q1 = tl.load(q_base, mask=q_mask, other=0.0)
+    q2 = tl.load(q_base + half_dim, mask=q_mask, other=0.0)
+    k1 = tl.load(k_base, mask=k_mask, other=0.0)
+    k2 = tl.load(k_base + half_dim, mask=k_mask, other=0.0)
+    x1 = tl.where(is_k[:, None], k1, q1).to(tl.float32)
+    x2 = tl.where(is_k[:, None], k2, q2).to(tl.float32)
+    qw1 = tl.load(q_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    qw2 = tl.load(q_weight_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
+    kw1 = tl.load(k_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    kw2 = tl.load(k_weight_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.where(is_k[:, None], kw1[None, :], qw1[None, :])
+    w2 = tl.where(is_k[:, None], kw2[None, :], qw2[None, :])
+    if STAGED_BF16:
+        x = tl.join(x1, x2).permute((0, 2, 1)).reshape((HEADS_PER_CTA, 2 * HALF_BLOCK))
+        var = tl.sum(x * x, axis=1) / head_dim
+    else:
+        var = (tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / head_dim
+    inv_rms = tl.rsqrt(var[:, None] + eps)
 
-    w1 = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    w2 = tl.load(w_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
-    x1_norm = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
-    x2_norm = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
+    if STAGED_BF16:
+        # Preserve the separate normalization and affine BF16 stores.
+        w1 = w1.to(tl.bfloat16).to(tl.float32)
+        w2 = w2.to(tl.bfloat16).to(tl.float32)
+        x1 = (x1 * inv_rms).to(tl.bfloat16).to(tl.float32)
+        x2 = (x2 * inv_rms).to(tl.bfloat16).to(tl.float32)
+        x1_norm = (x1 * w1).to(tl.bfloat16).to(tl.float32)
+        x2_norm = (x2 * w2).to(tl.bfloat16).to(tl.float32)
+    else:
+        x1_norm = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
+        x2_norm = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
 
     # --- Full RoPE (rotary_dim == head_dim) ---
     pos = tl.load(positions_ptr + token).to(tl.int64)
@@ -1002,10 +798,25 @@ def _fused_qk_rmsnorm_rope_kernel(
         cos_sin_cache_ptr + cache_offset + half_dim + offs, mask=mask, other=0.0
     ).to(tl.float32)
 
-    o1 = x1_norm * cos - x2_norm * sin
-    o2 = x2_norm * cos + x1_norm * sin
-    tl.store(out_base + offs, o1, mask=mask)
-    tl.store(out_base + half_dim + offs, o2, mask=mask)
+    if STAGED_BF16:
+        cos = cos.to(tl.bfloat16).to(tl.float32)
+        sin = sin.to(tl.bfloat16).to(tl.float32)
+        # Each product is materialized in BF16 before the rotary sum.
+        o1 = (x1_norm * cos).to(tl.bfloat16).to(tl.float32) - (x2_norm * sin).to(
+            tl.bfloat16
+        ).to(tl.float32)
+        o2 = (x2_norm * cos).to(tl.bfloat16).to(tl.float32) + (x1_norm * sin).to(
+            tl.bfloat16
+        ).to(tl.float32)
+    else:
+        o1 = x1_norm * cos - x2_norm * sin
+        o2 = x2_norm * cos + x1_norm * sin
+    q_out_base = q_out_ptr + token * q_out_stride_t + offsets
+    k_out_base = k_out_ptr + token * k_out_stride_t + offsets
+    tl.store(q_out_base, o1, mask=q_mask)
+    tl.store(q_out_base + half_dim, o2, mask=q_mask)
+    tl.store(k_out_base, o1, mask=k_mask)
+    tl.store(k_out_base + half_dim, o2, mask=k_mask)
 
 
 def fused_qk_rmsnorm_rope(
@@ -1019,8 +830,9 @@ def fused_qk_rmsnorm_rope(
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    staged_bf16: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused split + QK-RMSNorm + full RoPE for DFLASH attention layers.
+    """Fused per-head QK-RMSNorm + full NeoX RoPE.
 
     Replaces 3 kernel launches (qk_rmsnorm + RoPE) with a single triton
     kernel.  Assumes rotary_dim == head_dim (full rotation, no pass-through
@@ -1037,12 +849,18 @@ def fused_qk_rmsnorm_rope(
         num_q_heads: number of Q heads (after TP split)
         num_kv_heads: number of KV heads (after TP split)
         head_dim: per-head dimension (must be even)
+        staged_bf16: Round weights, factors, normalized values, affine results,
+            and each rotary product to BF16 before the next operation. Requires
+            BF16 q/k. False retains the ordinary FP32 intermediates.
 
     Returns:
         (q_out, k_out) — both contiguous (n_tokens, heads * head_dim)
     """
     if head_dim % 2 != 0:
         raise ValueError(f"head_dim must be even, got {head_dim}")
+
+    if staged_bf16 and (q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16):
+        raise ValueError("staged_bf16 requires BF16 q and k")
 
     n_tokens = q.shape[0]
     if n_tokens == 0:
@@ -1066,7 +884,10 @@ def fused_qk_rmsnorm_rope(
     q_stride = q.stride(0) if q.dim() > 1 else q.shape[-1]
     k_stride = k.stride(0) if k.dim() > 1 else k.shape[-1]
 
-    grid = (n_tokens, num_q_heads + num_kv_heads)
+    heads_per_cta = 8 if staged_bf16 else 1
+    if staged_bf16:
+        num_warps = max(4, num_warps)
+    grid = (n_tokens * triton.cdiv(num_q_heads + num_kv_heads, heads_per_cta),)
     _fused_qk_rmsnorm_rope_kernel[grid](
         q,
         k,
@@ -1088,6 +909,9 @@ def fused_qk_rmsnorm_rope(
         eps,
         INPUT_DTYPE=tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16,
         HALF_BLOCK=half_block,
+        STAGED_BF16=staged_bf16,
+        HEADS_PER_CTA=heads_per_cta,
+        enable_fp_fusion=not staged_bf16,
         num_warps=num_warps,
         num_stages=2,
     )
@@ -1101,5 +925,4 @@ __all__ = [
     "fused_qk_rmsnorm_rope_gate",
     "fused_qk_rmsnorm_rope",
     "rmsnorm_fused_parallel",
-    "triton_staged_qk_rmsnorm_rope",
 ]

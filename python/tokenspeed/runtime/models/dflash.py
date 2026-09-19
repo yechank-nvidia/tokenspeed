@@ -168,6 +168,7 @@ class DFlashAttention(nn.Module):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+            staged_bf16=False,
         )
         k_cache = k.view(-1, self.num_kv_heads, self.head_dim)
         v_cache = v.view(-1, self.num_kv_heads, self.head_dim)

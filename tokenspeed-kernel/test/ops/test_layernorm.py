@@ -419,15 +419,24 @@ def test_rmsnorm_inplace(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _ref_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _ref_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, staged_bf16: bool
+) -> torch.Tensor:
     """Per-head RMSNorm reference (standard, NOT Gemma)."""
     x_f = x.float()
     var = x_f.pow(2).mean(dim=-1, keepdim=True)
-    return (x_f * torch.rsqrt(var + eps) * weight.float()).to(x.dtype)
+    normalized = x_f * torch.rsqrt(var + eps)
+    if staged_bf16:
+        normalized = normalized.bfloat16().float()
+        weight = weight.bfloat16()
+    return (normalized * weight.float()).to(x.dtype)
 
 
 def _ref_rope_full(
-    x: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    staged_bf16: bool,
 ) -> torch.Tensor:
     """Full-dim RoPE reference (rotary_dim == head_dim)."""
     head_dim = x.shape[-1]
@@ -437,22 +446,29 @@ def _ref_rope_full(
     sin = cos_sin_cache[positions.long(), half:].float()
     x_f = x.float()
     x1, x2 = x_f[..., :half], x_f[..., half:]
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
+    if staged_bf16:
+        cos, sin = cos.bfloat16().float(), sin.bfloat16().float()
+        o1 = (x1 * cos).bfloat16().float() - (x2 * sin).bfloat16().float()
+        o2 = (x2 * cos).bfloat16().float() + (x1 * sin).bfloat16().float()
+    else:
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
     return torch.cat([o1, o2], dim=-1).to(x.dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "num_q_heads,num_kv_heads,head_dim",
-    [(8, 8, 128), (8, 2, 128), (4, 4, 64)],
+    [(8, 8, 128), (8, 2, 128), (4, 4, 64), (3, 1, 96)],
 )
+@pytest.mark.parametrize("staged_bf16", [False, True])
 def test_fused_qk_rmsnorm_rope(
     dtype: torch.dtype,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
     device: str,
+    staged_bf16: bool,
 ) -> None:
     """Verify fused_qk_rmsnorm_rope matches separate qk_norm + RoPE."""
     n_tokens = 13
@@ -484,6 +500,7 @@ def test_fused_qk_rmsnorm_rope(
         num_q_heads,
         num_kv_heads,
         head_dim,
+        staged_bf16,
     )
 
     # --- Reference: per-head norm then full RoPE ---
@@ -491,10 +508,18 @@ def test_fused_qk_rmsnorm_rope(
     q_heads = q.view(n_tokens, num_q_heads, head_dim)
     k_heads = k.view(n_tokens, num_kv_heads, head_dim)
     q_normed = torch.stack(
-        [_ref_rmsnorm(q_heads[:, h], q_weight, eps) for h in range(num_q_heads)], dim=1
+        [
+            _ref_rmsnorm(q_heads[:, h], q_weight, eps, staged_bf16)
+            for h in range(num_q_heads)
+        ],
+        dim=1,
     ).view(n_tokens, num_q_heads * head_dim)
     k_normed = torch.stack(
-        [_ref_rmsnorm(k_heads[:, h], k_weight, eps) for h in range(num_kv_heads)], dim=1
+        [
+            _ref_rmsnorm(k_heads[:, h], k_weight, eps, staged_bf16)
+            for h in range(num_kv_heads)
+        ],
+        dim=1,
     ).view(n_tokens, num_kv_heads * head_dim)
 
     # Apply RoPE per head
@@ -502,14 +527,14 @@ def test_fused_qk_rmsnorm_rope(
     k_ref_heads = k_normed.view(n_tokens, num_kv_heads, head_dim)
     q_ref = torch.stack(
         [
-            _ref_rope_full(q_ref_heads[:, h], cos_sin_cache, positions)
+            _ref_rope_full(q_ref_heads[:, h], cos_sin_cache, positions, staged_bf16)
             for h in range(num_q_heads)
         ],
         dim=1,
     ).view(n_tokens, num_q_heads * head_dim)
     k_ref = torch.stack(
         [
-            _ref_rope_full(k_ref_heads[:, h], cos_sin_cache, positions)
+            _ref_rope_full(k_ref_heads[:, h], cos_sin_cache, positions, staged_bf16)
             for h in range(num_kv_heads)
         ],
         dim=1,
@@ -520,9 +545,11 @@ def test_fused_qk_rmsnorm_rope(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("staged_bf16", [False, True])
 def test_fused_qk_rmsnorm_rope_non_contiguous_input(
     dtype: torch.dtype,
     device: str,
+    staged_bf16: bool,
 ) -> None:
     """Verify the kernel handles non-contiguous q/k views from qkv.split()."""
     n_tokens = 5
@@ -561,6 +588,7 @@ def test_fused_qk_rmsnorm_rope_non_contiguous_input(
         num_q_heads,
         num_kv_heads,
         head_dim,
+        staged_bf16,
     )
 
     # Compare with contiguous version
@@ -575,7 +603,48 @@ def test_fused_qk_rmsnorm_rope_non_contiguous_input(
         num_q_heads,
         num_kv_heads,
         head_dim,
+        staged_bf16,
     )
 
     torch.testing.assert_close(q_fused, q_contig_fused, atol=0, rtol=0)
     torch.testing.assert_close(k_fused, k_contig_fused, atol=0, rtol=0)
+
+
+def test_fused_qk_rope_staged_rounding_and_graph_replay(device):
+    q = torch.ones((3, 256), device=device, dtype=torch.bfloat16)
+    q[:, 1::2] = 3.0
+    k = torch.full((3, 128), -1.0, device=device, dtype=torch.bfloat16)
+    qw = torch.linspace(0.8, 1.2, 128, device=device)
+    kw = qw.flip(0).bfloat16()
+    cache = torch.linspace(-0.95, 1.05, 5 * 128, device=device).reshape(5, 128)
+    positions = torch.tensor([4, 0, 2], device=device, dtype=torch.int64)
+    args = (q, k, qw, kw, cache, positions, 1e-6, 2, 1, 128)
+    fused_qk_rmsnorm_rope(*args, True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = fused_qk_rmsnorm_rope(*args, True)
+    for position in (0, 4):
+        q.mul_(0.5)
+        k.neg_()
+        qw.add_(0.015625)
+        cache.mul_(-0.9)
+        positions.fill_(position)
+        graph.replay()
+        for actual, source, weight, heads in zip(result, (q, k), (qw, kw), (2, 1)):
+            source = source.reshape(3, heads, 128)
+            expected = torch.stack(
+                [
+                    _ref_rope_full(
+                        _ref_rmsnorm(source[:, h], weight, 1e-6, True),
+                        cache,
+                        positions,
+                        True,
+                    )
+                    for h in range(heads)
+                ],
+                dim=1,
+            ).reshape_as(actual)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    ordinary = fused_qk_rmsnorm_rope(*args, False)
+    assert any(not torch.equal(a, b) for a, b in zip(result, ordinary))
