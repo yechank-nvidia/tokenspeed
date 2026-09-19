@@ -944,7 +944,7 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     # its own spec.
     if not current_platform().is_cdna5 or k < 256:
         return False
-    return _select(m, n, k, True) is not torch_decode_gemv
+    return _select(m, n, k, True, x.dtype) is not torch_decode_gemv
 
 
 @functools.lru_cache(maxsize=8)

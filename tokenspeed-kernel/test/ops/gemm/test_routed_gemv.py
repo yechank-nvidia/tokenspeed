@@ -74,7 +74,7 @@ def _routed_cases():
 def test_dispatch_picks_the_measured_backend(shape, backend):
     m, n, k = shape
     _select.cache_clear()
-    impl = _select(m, n, k, True)
+    impl = _select(m, n, k, True, torch.bfloat16)
     assert backend in getattr(
         impl, "__name__", ""
     ), f"M={m} N={n} K={k} resolved {impl} instead of the measured {backend}"
@@ -263,14 +263,14 @@ def test_skinny_add3_unwarmed_capture_falls_back(monkeypatch):
 
 def test_unlisted_shapes_keep_the_generic_selection():
     _select.cache_clear()
-    impl = _select(1, 999, 4096, True)
+    impl = _select(1, 999, 4096, True, torch.bfloat16)
     assert "rowcta" in getattr(impl, "__name__", "")
-    impl = _select(4, 3216, 7168, True)
+    impl = _select(4, 3216, 7168, True, torch.bfloat16)
     assert "torch" in getattr(impl, "__name__", "")
     # A width no call site produces.
-    impl = _select(3, 6289, 7168, True)
+    impl = _select(3, 6289, 7168, True, torch.bfloat16)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(1, 2304, 1536, True)
+    impl = _select(1, 2304, 1536, True, torch.bfloat16)
     assert "rowcta" in getattr(impl, "__name__", "")
 
 
@@ -708,3 +708,80 @@ def test_cdna5_route_declines_unregistered_calls():
     assert not decode_gemv_routed(
         unaligned_n, torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16)
     )
+
+
+@pytest.mark.parametrize(
+    "n,k", [(0, 17), (1, 1), (19, 127), (257, 1025), (257, 8192), (3, 65536)]
+)
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_fp32_decode_gemv(n, k, preallocated):
+    torch.manual_seed(71)
+    x = torch.randn(1, k, device="cuda")
+    weight = torch.randn(n, k, device="cuda")
+    out = torch.empty(1, n, device="cuda") if preallocated else None
+    result = decode_gemv(x, weight, out)
+    ref = (x.double() @ weight.double().t()).float()
+    torch.testing.assert_close(result, ref, rtol=2e-5, atol=2e-4)
+    if out is not None:
+        assert result is out
+    assert torch.equal(result, decode_gemv(x, weight, None))
+
+
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="CUDA graph replay requires NVIDIA"
+)
+def test_fp32_decode_gemv_graph_replay():
+    x = torch.randn(1, 258, device="cuda")[:, 1:]
+    weight = torch.randn(130, 257, device="cuda")[1:]
+    storage = torch.full((1, 130), 77.0, device="cuda")
+    out = storage[:, 1:]
+    decode_gemv(x, weight, out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert decode_gemv(x, weight, out) is out
+    for _ in range(2):
+        x.normal_()
+        weight.normal_()
+        graph.replay()
+        ref = (x.double() @ weight.double().t()).float()
+        torch.testing.assert_close(out, ref, rtol=2e-5, atol=2e-4)
+        assert storage[0, 0].item() == 77.0
+
+
+@pytest.mark.parametrize("k", [0, 65537])
+def test_fp32_decode_gemv_reduction_bounds(k):
+    x = torch.ones(1, k, device="cuda")
+    weight = torch.ones(3, k, device="cuda")
+    result = decode_gemv(x, weight, None)
+    torch.testing.assert_close(
+        result, torch.full_like(result, float(k)), atol=0, rtol=0
+    )
+
+
+def test_decode_gemv_selection_respects_dtype():
+    from tokenspeed_kernel.ops.gemm.triton_gemv import (
+        torch_decode_gemv,
+        triton_rowcta_gemv,
+    )
+
+    _select.cache_clear()
+    for dtype in (torch.bfloat16, torch.float32, torch.float16, torch.float32):
+        impl = _select(1, 999, 4096, True, dtype)
+        assert impl is (
+            torch_decode_gemv if dtype == torch.float16 else triton_rowcta_gemv
+        )
+
+
+def test_fp32_decode_gemv_ignores_torch_reduced_precision():
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("high")
+        x = torch.randn(1, 257, device="cuda")
+        weight = torch.randn(129, 257, device="cuda")
+        ref = (x.double() @ weight.double().t()).float()
+        torch.testing.assert_close(decode_gemv(x, weight), ref, rtol=2e-5, atol=2e-4)
+        # Noncontiguous rows use the existing Torch fallback correctly.
+        torch.testing.assert_close(decode_gemv(x, weight[::2]), x @ weight[::2].t())
+    finally:
+        torch.set_float32_matmul_precision(previous)
