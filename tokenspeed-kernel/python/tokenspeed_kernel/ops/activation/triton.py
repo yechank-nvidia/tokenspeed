@@ -43,37 +43,6 @@ __all__ = [
 ]
 
 
-@triton.jit(do_not_specialize=["floor", "temperature"])
-def _attention_gate_mul_kernel(
-    output_ptr,
-    gate_ptr,
-    bias_ptr,
-    num_elements,
-    floor,
-    temperature,
-    HIDDEN_DIM: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    GATE_ROW_STRIDE: tl.constexpr,
-    GATE_HEAD_STRIDE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < num_elements
-    row = offsets // HIDDEN_DIM
-    column = offsets % HIDDEN_DIM
-    head = column // HEAD_DIM
-    dimension = column % HEAD_DIM
-    gate = tl.load(
-        gate_ptr + row * GATE_ROW_STRIDE + head * GATE_HEAD_STRIDE + dimension,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    bias = tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
-    output = tl.load(output_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    multiplier = floor + (1.0 - floor) * tl.sigmoid((gate + bias) / temperature)
-    tl.store(output_ptr + offsets, output * multiplier, mask=mask)
-
-
 @register_kernel(
     "activation",
     "attention_gate_mul",
@@ -100,7 +69,9 @@ def triton_attention_gate_mul(
     """Apply a biased per-head attention gate in place.
 
     Compute ``output *= floor + (1-floor) * sigmoid((gate+bias)/temperature)``
-    in FP32 and round to the output dtype on store. All tensors must share
+    with separately rounded FP32 operations and round to the output dtype on
+    store. Scalar division uses the FP32 reciprocal, matching eager tensor
+    division by a Python scalar. All tensors must share
     a CUDA or ROCm device. Nonempty output storage must be separate from
     gate and bias storage, including disjoint views of one allocation.
 
@@ -154,19 +125,21 @@ def triton_attention_gate_mul(
         raise ValueError("output must not share storage with gate or head_bias")
 
     block = 256
-    _attention_gate_mul_kernel[(triton.cdiv(output.numel(), block),)](
+    _sigmoid_mul_kernel[(triton.cdiv(output.numel(), block),)](
         output,
         gate,
-        head_bias,
         output.numel(),
+        head_bias,
         floor,
+        1.0 - floor,
         temperature,
-        HIDDEN_DIM=width,
-        HEAD_DIM=head_dim,
-        GATE_ROW_STRIDE=gate.stride(0),
-        GATE_HEAD_STRIDE=head_dim if gate.dim() == 2 else gate.stride(1),
-        BLOCK=block,
+        hidden_dim=width,
+        head_dim=head_dim,
+        gate_row_stride=gate.stride(0),
+        gate_head_stride=head_dim if gate.dim() == 2 else gate.stride(1),
+        BLOCK_SIZE=block,
         num_warps=4,
+        enable_fp_fusion=False,
     )
     return output
 
@@ -272,11 +245,15 @@ def fused_gate_sigmoid_mul_add(
     return final_hidden_states
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["floor", "one_minus_floor", "temperature"])
 def _sigmoid_mul_kernel(
     x_ptr,
     gate_ptr,
     n_elements,
+    bias_ptr,
+    floor,
+    one_minus_floor,
+    temperature,
     hidden_dim: tl.constexpr,
     head_dim: tl.constexpr,
     gate_row_stride: tl.constexpr,
@@ -296,7 +273,16 @@ def _sigmoid_mul_kernel(
 
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     g = tl.load(gate_addrs, mask=mask).to(tl.float32)
-    out = x * tl.sigmoid(g)
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
+        # Match the eager FP32 sequence, including the scalar reciprocal and
+        # sigmoid division. This launch disables contraction of adjacent ops.
+        logits = (g + bias) * libdevice.div_rn(1.0, temperature)
+        sigmoid = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-logits))
+        multiplier = floor + one_minus_floor * sigmoid
+    else:
+        multiplier = tl.sigmoid(g)
+    out = x * multiplier
     tl.store(x_ptr + offsets, out, mask=mask)
 
 
@@ -354,6 +340,10 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x,
         gate,
         n,
+        None,
+        0.0,
+        1.0,
+        1.0,
         hidden_dim=hidden_dim,
         head_dim=head_dim,
         gate_row_stride=gate_row_stride,

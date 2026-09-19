@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.activation import attention_gate_mul
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     sigmoid_mul,
@@ -20,6 +21,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("biased", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "shape",
@@ -27,16 +29,21 @@ pytestmark = pytest.mark.skipif(
     [(1, 4096), (17, 6144), (128, 4096), (256, 8192)],
 )
 def test_sigmoid_mul_matches_eager(
-    dtype: torch.dtype, shape: tuple[int, int], device: str
+    dtype: torch.dtype, shape: tuple[int, int], device: str, biased: bool
 ) -> None:
     x = torch.randn(shape, device=device, dtype=dtype)
     gate = torch.randn(shape, device=device, dtype=dtype)
-    ref = x.to(torch.float32) * gate.to(torch.float32).sigmoid()
+    if biased:
+        bias = torch.randn(4, device=device)
+        logits = (gate.float().view(shape[0], 4, -1) + bias[None, :, None]) / 0.7
+        ref = x.float() * (0.2 + 0.8 * logits.sigmoid()).reshape(shape)
+        out = attention_gate_mul(x.clone(), gate, bias, 0.2, 0.7)
+    else:
+        ref = x.float() * gate.float().sigmoid()
+        out = sigmoid_mul(x.clone(), gate)
     ref = ref.to(dtype)
 
-    out = sigmoid_mul(x.clone(), gate)
-
-    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    tol = 0.0 if biased else (1e-2 if dtype == torch.bfloat16 else 5e-3)
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
 
 
@@ -47,11 +54,16 @@ def test_sigmoid_mul_is_inplace(device: str) -> None:
     assert same.data_ptr() == x.data_ptr()
 
 
-def test_sigmoid_mul_empty(device: str) -> None:
+@pytest.mark.parametrize("biased", [False, True])
+def test_sigmoid_mul_empty(device: str, biased: bool) -> None:
     x = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
     gate = torch.empty_like(x)
-    out = sigmoid_mul(x, gate)
-    assert out.shape == x.shape
+    out = (
+        attention_gate_mul(x, gate, torch.zeros(4, device=device), 0.2, 0.7)
+        if biased
+        else sigmoid_mul(x, gate)
+    )
+    assert out is x
 
 
 def test_sigmoid_mul_rejects_shape_mismatch(device: str) -> None:
@@ -68,6 +80,7 @@ def test_sigmoid_mul_rejects_dtype_mismatch(device: str) -> None:
         sigmoid_mul(x, gate)
 
 
+@pytest.mark.parametrize("biased", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim",
@@ -81,6 +94,7 @@ def test_sigmoid_mul_strided_gate_from_qkv_split(
     num_kv_heads: int,
     head_dim: int,
     device: str,
+    biased: bool,
 ) -> None:
     """Runtime path: gate is the [T, H, D] strided view obtained via
     ``qkv.split`` → ``.view(T, H, 2*D)`` → ``torch.chunk(q_gate, 2, dim=-1)``.
@@ -100,13 +114,50 @@ def test_sigmoid_mul_strided_gate_from_qkv_split(
     assert gate.stride(-1) == 1
 
     x = torch.randn(num_tokens, q_size, device=device, dtype=dtype)
-    ref = x.to(torch.float32) * gate.reshape(num_tokens, -1).to(torch.float32).sigmoid()
+    if biased:
+        bias = torch.randn(num_heads, device=device, dtype=torch.bfloat16)
+        logits = (gate.float() + bias.float()[None, :, None]) / 0.7
+        ref = x.float() * (0.2 + 0.8 * logits.sigmoid()).reshape(x.shape)
+        out = attention_gate_mul(x.clone(), gate, bias, 0.2, 0.7)
+    else:
+        ref = x.float() * gate.reshape(num_tokens, -1).float().sigmoid()
+        out = sigmoid_mul(x.clone(), gate)
     ref = ref.to(dtype)
 
-    out = sigmoid_mul(x.clone(), gate)
-
-    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    tol = 0.0 if biased else (1e-2 if dtype == torch.bfloat16 else 5e-3)
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="CUDA graph replay requires NVIDIA")
+def test_attention_gate_graph_replay(device: str) -> None:
+    x = torch.randn(7, 39, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(7, 3, 26, device=device, dtype=x.dtype)[:, :, 13:]
+    bias = torch.randn(3, device=device)
+    attention_gate_mul(x, gate, bias, 0.2, 0.7)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = attention_gate_mul(x, gate, bias, 0.2, 0.7)
+    assert out is x
+    for _ in range(2):
+        x.normal_()
+        gate.normal_()
+        bias.normal_()
+        logits = (gate.float() + bias[None, :, None]) / 0.7
+        ref = (x.float() * (0.2 + 0.8 * logits.sigmoid()).reshape(x.shape)).to(x.dtype)
+        graph.replay()
+        torch.testing.assert_close(x, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan")])
+def test_attention_gate_rejects_invalid_temperature(
+    device: str, temperature: float
+) -> None:
+    x = torch.empty(1, 32, device=device)
+    with pytest.raises(ValueError, match="finite and positive"):
+        attention_gate_mul(
+            x, torch.empty_like(x), torch.zeros(2, device=device), 0.2, temperature
+        )
 
 
 def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:

@@ -10,7 +10,11 @@ arguments explicit. It updates and returns `output`:
 output[t, h, d] *= floor + (1 - floor) * sigmoid((gate[t, h, d] + head_bias[h]) / temperature)
 ```
 
-The arithmetic runs in FP32 and rounds to the output dtype on store.
+The biased gate reuses the existing `sigmoid_mul` kernel rather than a
+separate device implementation. Its FP32 operations round separately, with
+an FP32 reciprocal for scalar division and contraction disabled; the final
+store rounds to the output dtype. The ordinary unbiased `sigmoid_mul` call
+retains its existing sigmoid arithmetic.
 
 - `output`: contiguous BF16, FP16 or FP32 `[T, H * D]`.
 - `gate`: matching dtype, either `[T, H * D]` or `[T, H, D]`. Token and head
@@ -22,13 +26,14 @@ The arithmetic runs in FP32 and rounds to the output dtype on store.
   disjoint views of the same allocation. Contiguous storage offsets are allowed.
 - Empty output tensors return without a kernel launch.
 
-The portable Triton implementation is registered as `triton_attention_gate_mul`
-in `activation.attention_gate_mul`. Warm up the input shape before CUDA Graph
+The portable Triton adapter remains registered as `triton_attention_gate_mul`
+in `activation.attention_gate_mul`; both gate APIs dispatch the shared
+`_sigmoid_mul_kernel`. Warm up the input shape before CUDA Graph
 capture. Replay reads the current output and gate values, so callers should
 refresh the output before each replay when repeated gating is not intended.
 
 Run the public API, numerical and graph tests with:
 
 ```bash
-python -m pytest tokenspeed-kernel/test/ops/test_attention_output_gate.py -q
+python -m pytest tokenspeed-kernel/test/ops/test_activation.py -q
 ```
