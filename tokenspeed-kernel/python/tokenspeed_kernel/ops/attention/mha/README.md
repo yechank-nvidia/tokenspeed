@@ -35,3 +35,17 @@ The same prepared view is valid for eager calls and graph replay. There is
 no per-forward fill, value check, graph-only workspace branch or new global
 cache. Passing `None` remains an explicit choice when callers cannot provide
 this lifetime guarantee.
+
+## Grouped decode KV tiles
+
+On NVIDIA SM100, grouped decode with BF16 Q/K/V, 128-wide key/value heads
+and 64-token pages uses a 128-token KV tile. Other configurations retain
+their existing tile sizes. This is an execution-geometry choice in the same
+kernel, independent of batch size, query width and compute window; eager
+execution and graph capture use the same selection.
+
+Larger tiles reduce online-softmax loop iterations. Split counts, scratch
+ownership, causal/window masks and stage2 do not change. The different
+reduction grouping can change output bits; BF16 results are tested against
+the existing SDPA tolerance, not bitwise equality with the smaller-tile
+implementation. No model-specific path or persistent state is introduced.

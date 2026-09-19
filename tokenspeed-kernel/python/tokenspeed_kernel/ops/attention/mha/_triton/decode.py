@@ -25,7 +25,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.mha._workspace import (
     prepare_mha_decode_workspace,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 _MIN_BLOCK_KV = 32
 
@@ -462,6 +462,16 @@ def _decode_grouped_att_m_fwd(
     BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
+
+    # Wider KV tiles reduce online-softmax iterations for SM100 BF16 heads.
+    if (
+        platform.is_nvidia
+        and platform.arch_version == ArchVersion(10, 0)
+        and q.dtype == k_buffer.dtype == v_buffer.dtype == torch.bfloat16
+        and Lk == Lv == 128
+        and page_size == 64
+    ):
+        BLOCK = 128
 
     # MI3xx uses a smaller block size for large heads to stay within shmem limits.
     if platform.is_amd and Lk >= 576:
