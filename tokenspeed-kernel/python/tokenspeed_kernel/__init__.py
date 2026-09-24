@@ -58,6 +58,7 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.moe import (
     moe_apply,
+    moe_group_mask,
     moe_plan,
     moe_process_weights,
     moe_topk,
@@ -132,6 +133,7 @@ __all__ = [
     # moe
     "native_latent_moe_available",
     "moe_apply",
+    "moe_group_mask",
     "moe_plan",
     "moe_process_weights",
     "moe_topk",
