@@ -30,6 +30,7 @@ from typing import Literal
 
 from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.utils import (
@@ -90,6 +91,137 @@ def _nonempty_str(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("value must be a non-empty string")
     return value
+
+
+KERNEL_OVERRIDE_ENV_PREFIX = "TOKENSPEED_KERNEL_OVERRIDE_"
+
+# The kernel solution each ``--attention-backend`` value pins on the operators
+# the paged MHA and MLA leaves dispatch with ``solution=``; ``None`` leaves the
+# choice to selection. The leaves register one attention backend per key, so
+# the keys are also their backend names. The Inkling wrapper dispatches its
+# relative-position MHA operators with the pin of the MHA leaf it wraps. The
+# maps live here, below the attention backends, because validate() needs them
+# before any backend module is loaded.
+MHA_KERNEL_SOLUTION_BY_BACKEND: dict[str, str | None] = {
+    "mha": None,
+    "fa3": "fa3",
+    "fa4": "fa4",
+    "triton": "triton",
+    "flashinfer": "flashinfer",
+}
+MLA_KERNEL_SOLUTION_BY_BACKEND: dict[str, str | None] = {
+    "mla": None,
+    "gluon": "gluon",
+}
+# Operators whose override must belong to the pinned solution; otherwise the
+# override would silently outrank the solution the leaf asks for: every
+# operator some leaf hands to ``select_kernel`` with ``solution=`` derived
+# from ``--attention-backend`` (the paged MHA and MLA leaves, and the Inkling
+# wrapper's rel-MHA dispatches through its MHA leaf). Every other attention
+# operator (GDN, KDA, DSA, ...) is not pinned by ``--attention-backend`` and
+# is not constrained here, nor is an MHA/MLA operator under a backend outside
+# its map (``trtllm``, ``flashmla``, ...), which does not route through it.
+# test_kernel_override_args derives this key set from the dispatch sites, so
+# a new ``solution=`` leaf dispatch needs a row here.
+KERNEL_OVERRIDE_SOLUTION_RULES: dict[tuple[str, str], dict[str, str | None]] = {
+    ("attention", "mha_prefill"): MHA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "mha_extend_with_kvcache"): MHA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "mha_decode_with_kvcache"): MHA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "rel_mha_prefill"): MHA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "rel_mha_extend_with_kvcache"): MHA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "rel_mha_decode_with_kvcache"): MHA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "mla_prefill"): MLA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "mla_extend_with_kvcache"): MLA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "mla_decode_with_kvcache"): MLA_KERNEL_SOLUTION_BY_BACKEND,
+    ("attention", "mla_decode_projected_value"): MLA_KERNEL_SOLUTION_BY_BACKEND,
+}
+
+
+def pinned_kernel_solution(
+    family: str, mode: str, attention_backend: str | None
+) -> str | None:
+    """The solution ``attention_backend`` pins for the operator, or ``None``.
+
+    ``None`` when no rule covers the operator (it is not pinned by
+    ``--attention-backend``), when the backend is not one of the paged MHA/MLA
+    backends, or when it leaves the choice to selection.
+    """
+    rule = KERNEL_OVERRIDE_SOLUTION_RULES.get((family, mode))
+    if rule is None:
+        return None
+    return rule.get(attention_backend)
+
+
+def parse_kernel_overrides(entries: list[str] | None) -> dict[tuple[str, str], str]:
+    """Parse ``FAMILY.MODE=KERNEL_NAME`` entries into ``(family, mode) -> name``.
+
+    Raises ``ValueError`` for an entry without ``=`` or ``.``, an empty family,
+    mode or kernel name, or two entries naming the same operator.
+    """
+    table: dict[tuple[str, str], str] = {}
+    for entry in entries or ():
+        operator, separator, name = entry.partition("=")
+        family, dot, mode = operator.partition(".")
+        if not (separator and dot and family and mode and name):
+            raise ValueError(
+                f"--kernel-override entry {entry!r} must have the form "
+                "FAMILY.MODE=KERNEL_NAME"
+            )
+        key = (family, mode)
+        if key in table:
+            raise ValueError(
+                f"--kernel-override names {family}.{mode} twice "
+                f"({table[key]!r} and {name!r}); give each operator one kernel"
+            )
+        table[key] = name
+    return table
+
+
+def kernel_override_env_key(family: str, mode: str) -> str:
+    """The variable ``tokenspeed_kernel.selection.select_kernel`` reads for an operator."""
+    return f"{KERNEL_OVERRIDE_ENV_PREFIX}{family.upper()}_{mode.upper()}"
+
+
+def kernel_override_lines(table: dict[tuple[str, str], str]) -> list[str]:
+    """Sorted ``family.mode=name`` lines: the per-rank log and ready-dict form."""
+    return sorted(f"{family}.{mode}={name}" for (family, mode), name in table.items())
+
+
+def assert_kernel_override_env(table: dict[tuple[str, str], str]) -> None:
+    """Mirror the override table into this process's environment.
+
+    A variable that already holds a different, non-empty value is an error:
+    the command line and the environment must agree, neither silently
+    outranks the other. Every entry is checked before any is written, so a
+    rejected table leaves the environment as it was. Re-asserting an
+    identical table is a no-op, which is what every rank does after it is
+    spawned.
+    """
+    conflicts: list[str] = []
+    for (family, mode), name in table.items():
+        key = kernel_override_env_key(family, mode)
+        current = os.environ.get(key)
+        if current and current != name:
+            conflicts.append(
+                f"{key}={current!r} is already set and differs from "
+                f"--kernel-override {family}.{mode}={name}"
+            )
+    if conflicts:
+        raise ValueError(
+            "; ".join(conflicts) + "; unset the variable(s) or drop the flag"
+        )
+    for (family, mode), name in table.items():
+        os.environ[kernel_override_env_key(family, mode)] = name
+
+
+def check_kernel_override_tables_agree(tables: list[list[str]]) -> None:
+    """Every rank's ready dict must report the same ``kernel_overrides`` lines."""
+    for rank, table in enumerate(tables):
+        if table != tables[0]:
+            raise RuntimeError(
+                f"kernel_overrides differ across ranks: rank 0 reports "
+                f"{tables[0]!r}, rank {rank} reports {table!r}"
+            )
 
 
 @dataclasses.dataclass
@@ -252,6 +384,12 @@ class ServerArgs:
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
+    # Per-operator kernel overrides, ``FAMILY.MODE=KERNEL_NAME`` entries from the
+    # repeatable ``--kernel-override``. Kernel names only: validate() checks each
+    # entry against the populated registry and mirrors it into the
+    # ``TOKENSPEED_KERNEL_OVERRIDE_{FAMILY}_{MODE}`` variable that
+    # ``tokenspeed_kernel.selection.select_kernel`` consults.
+    kernel_override: list[str] | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
@@ -536,6 +674,13 @@ class ServerArgs:
                 self.sampling_backend = "flashinfer"
             else:
                 self.sampling_backend = "greedy"
+        # Fail fast on a malformed override table; validate() checks the
+        # names against the registry and mirrors them into the environment.
+        self.kernel_override_table()
+
+    def kernel_override_table(self) -> dict[tuple[str, str], str]:
+        """The parsed ``--kernel-override`` table, ``(family, mode) -> kernel name``."""
+        return parse_kernel_overrides(self.kernel_override)
 
     def resolve_launcher_topology(self):
         """Fill in unset multi-node arguments from the launcher environment."""
@@ -965,6 +1110,68 @@ class ServerArgs:
             # Enable PDL for fused attention kernels.
             os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+
+        self.validate_kernel_overrides()
+
+    def validate_kernel_overrides(self):
+        """Check ``--kernel-override`` against the populated registry and mirror it.
+
+        Rejected: a kernel name that is not registered, a name registered under
+        another operator, ``moe.apply`` (the MoE plan pins its apply kernel, and
+        an environment override would silently outrank that contract), and a
+        kernel for one of the paged MHA/MLA or Inkling rel-MHA operators in
+        ``KERNEL_OVERRIDE_SOLUTION_RULES`` whose solution is not the one
+        ``--attention-backend`` pins there. Accepted entries are written to
+        ``TOKENSPEED_KERNEL_OVERRIDE_{FAMILY}_{MODE}``; a variable already set to
+        a different value is an error. Every rank re-asserts the same table in
+        ``run_event_loop`` because spawned workers do not re-run this method.
+        """
+        table = self.kernel_override_table()
+        if not table:
+            return
+        load_builtin_kernels()
+        registry = KernelRegistry.get()
+        for (family, mode), name in table.items():
+            flag = f"--kernel-override {family}.{mode}={name}"
+            if (family, mode) == ("moe", "apply"):
+                raise ValueError(
+                    f"{flag}: the MoE plan pins its apply kernel "
+                    "(plan['apply_kernel_name']); moe.apply cannot be overridden "
+                    "from the command line"
+                )
+            valid = self._kernel_override_choices(registry, family, mode, None)
+            spec = registry.get_by_name(name)
+            if spec is None:
+                raise ValueError(
+                    f"{flag}: no kernel named {name!r} is registered; valid names "
+                    f"for {family}.{mode}: {valid}"
+                )
+            if (spec.family, spec.mode) != (family, mode):
+                raise ValueError(
+                    f"{flag}: {name!r} is registered under {spec.family}.{spec.mode}, "
+                    f"not {family}.{mode}; valid names for {family}.{mode}: {valid}"
+                )
+            solution = pinned_kernel_solution(family, mode, self.attention_backend)
+            if solution is not None and spec.solution != solution:
+                valid = self._kernel_override_choices(registry, family, mode, solution)
+                raise ValueError(
+                    f"{flag}: kernel solution {spec.solution!r} conflicts with "
+                    f"--attention-backend {self.attention_backend} (solution "
+                    f"{solution!r}); valid names for {family}.{mode} under that "
+                    f"backend: {valid}"
+                )
+        assert_kernel_override_env(table)
+
+    @staticmethod
+    def _kernel_override_choices(
+        registry: KernelRegistry, family: str, mode: str, solution: str | None
+    ) -> str:
+        names = sorted(
+            spec.name
+            for spec in registry.list_kernels(family, mode)
+            if solution is None or spec.solution == solution
+        )
+        return ", ".join(names) if names else "(none registered)"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1673,6 +1880,25 @@ class ServerArgs:
             "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
+        )
+        parser.add_argument(
+            "--kernel-override",
+            type=str,
+            action="append",
+            metavar="FAMILY.MODE=KERNEL_NAME",
+            default=ServerArgs.kernel_override,
+            help="Force the registered kernel KERNEL_NAME for the operator "
+            "FAMILY.MODE (repeatable; one operator per flag). The name must be "
+            "registered under that operator; moe.apply is refused because the "
+            "MoE plan pins it, and a paged MHA/MLA or Inkling rel-MHA attention "
+            "kernel must belong to the solution --attention-backend pins for "
+            "that operator. Every "
+            "rank mirrors the table "
+            "into TOKENSPEED_KERNEL_OVERRIDE_{FAMILY}_{MODE}, logs one "
+            "'kernel_override FAMILY.MODE=NAME' line per entry at startup and "
+            "reports the sorted table as kernel_overrides in its ready dict; a "
+            "variable already set to a different value is an error. The table "
+            "is fixed before CUDA graph capture and immutable afterwards.",
         )
         parser.add_argument(
             "--dp-sampling",

@@ -94,7 +94,13 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
-from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    PortArgs,
+    ServerArgs,
+    assert_kernel_override_env,
+    kernel_override_env_key,
+    kernel_override_lines,
+)
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
@@ -1262,6 +1268,24 @@ def run_event_loop(
         shutdown_event.set()
 
     try:
+        # Re-assert the kernel override table in this rank: spawned workers do
+        # not re-run ServerArgs.__post_init__, and select_kernel reads the
+        # process environment. Inside the try so a conflicting pre-set variable
+        # is reported like any other startup failure (logged, SIGUSR1 to the
+        # parent). One prefixed line per entry is the per-rank witness; the
+        # same sorted lines, read back from the environment select_kernel will
+        # consult, go into the ready dict for the cross-rank check.
+        kernel_override_table = server_args.kernel_override_table()
+        assert_kernel_override_env(kernel_override_table)
+        kernel_overrides = kernel_override_lines(
+            {
+                key: os.environ[kernel_override_env_key(*key)]
+                for key in kernel_override_table
+            }
+        )
+        for line in kernel_overrides:
+            logger.info(f"kernel_override {line}")
+
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
             # instead of building the full EventLoop (KV/LM scheduler).
@@ -1300,6 +1324,7 @@ def run_event_loop(
                 "max_model_len": event_loop.max_model_len,
                 "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
+                "kernel_overrides": kernel_overrides,
             }
         )
 

@@ -183,6 +183,19 @@ setup, never publishes results; each kernel may delay it for performance.
 Streaming top-k, for example, avoids delaying scoring waves with waiting
 merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 
+Kernel overrides follow the same rule. `--kernel-override FAMILY.MODE=NAME`
+is validated once in the parent against the registry, mirrored into
+`TOKENSPEED_KERNEL_OVERRIDE_{FAMILY}_{MODE}`, and re-asserted by every rank
+in `run_event_loop` before the model loads, so the table is fixed before
+`capture_graphs()`. Selection runs inside the op wrappers during capture and
+the overridden kernel is baked into the graph; replay never re-enters
+selection. The table is immutable after capture: graphs retain their captured
+kernel choice, and a variable changed afterwards would desynchronize eager and
+replayed forwards, so recapture (restart) to change it. Each rank logs one
+`kernel_override FAMILY.MODE=NAME` line and reports the sorted table as
+`kernel_overrides` in its ready dict; the launcher requires the tables to
+agree across ranks.
+
 `fused_gate_sigmoid_mul_add`, `sigmoid_mul`, `silu_and_mul`, `swiglu_oai`,
 `situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
 themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model

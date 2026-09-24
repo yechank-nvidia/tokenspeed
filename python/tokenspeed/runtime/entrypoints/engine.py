@@ -91,7 +91,11 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
 from tokenspeed.runtime.utils.process import kill_process_tree
-from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    PortArgs,
+    ServerArgs,
+    check_kernel_override_tables_agree,
+)
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from tokenspeed.version import __version__
 
@@ -544,6 +548,29 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _check_ranks_agree_on_kernel_overrides(
+    server_args: ServerArgs, ready_infos: list[dict]
+) -> None:
+    """Every TP rank this launcher spawned must report the same override table.
+
+    Each rank re-asserts ``--kernel-override`` into its own environment and
+    reports the sorted table as ``kernel_overrides``; a rank-inconsistent table
+    would diverge replicated work (router logits, expert routing). The gate
+    below is temporary: only the per-rank event loop reports the key today,
+    while the DP controller forwards one summary dict of its own (built from
+    ``scheduler_info[0]``) and the LM-free encode loop sends its own ready
+    dict, so those launches carry no table to compare here and their witness
+    is the per-rank re-assert alone. Once ``data_parallel_controller.py``
+    compares its ranks' tables and forwards ``kernel_overrides`` (and
+    ``epd/encode_loop.py`` adds the key), drop the gate so one path remains.
+    """
+    if server_args.mapping.attn.has_dp or server_args.disaggregation_mode == "encode":
+        return
+    check_kernel_override_tables_agree(
+        [info["kernel_overrides"] for info in ready_infos]
+    )
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -656,6 +683,8 @@ def _launch_subprocesses(
             )
         scheduler_infos.append(data)
 
+    _check_ranks_agree_on_kernel_overrides(server_args, scheduler_infos)
+
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
@@ -753,6 +782,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         proc.start()
         scheduler_procs.append(proc)
 
+    ready_infos: list[dict] = []
     try:
         for i, reader in enumerate(scheduler_pipe_readers):
             try:
@@ -769,6 +799,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
                 )
+            ready_infos.append(data)
+        _check_ranks_agree_on_kernel_overrides(server_args, ready_infos)
         logger.info(
             "headless scheduler(s) ready; SMG handshake endpoint="
             f"{server_args.zmq_handshake_endpoint()!s}",
