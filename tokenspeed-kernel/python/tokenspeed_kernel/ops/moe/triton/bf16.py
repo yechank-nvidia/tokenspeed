@@ -22,55 +22,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel.ops.moe.expert_routing import StagePolicy, moe_expert_routing
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-
-@triton.jit
-def _routing_kernel(
-    topk_ids_ptr,
-    expert_route_ids_ptr,
-    expert_counts_ptr,
-    num_routes,
-    BLOCK_ROUTES: tl.constexpr,
-):
-    expert_id = tl.program_id(0)
-    count = 0
-    num_blocks = tl.cdiv(num_routes, BLOCK_ROUTES)
-    for block_id in range(num_blocks):
-        route_ids = block_id * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
-        route_mask = route_ids < num_routes
-        selected_experts = tl.load(topk_ids_ptr + route_ids, mask=route_mask, other=-1)
-        matches = route_mask & (selected_experts == expert_id)
-        local_rank = tl.cumsum(matches.to(tl.int32), axis=0) - 1
-        tl.store(
-            expert_route_ids_ptr + expert_id * num_routes + count + local_rank,
-            route_ids,
-            mask=matches,
-        )
-        count += tl.sum(matches.to(tl.int32), axis=0)
-    tl.store(expert_counts_ptr + expert_id, count)
-
-
-def _routing(
-    topk_ids: torch.Tensor, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor, str]:
-    topk_ids = topk_ids.to(torch.int32).contiguous()
-    num_routes = topk_ids.numel()
-    expert_route_ids = torch.empty(
-        (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
-    )
-    expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
-    block_routes = 128 if num_routes <= 128 else 1024
-    _routing_kernel[(num_experts,)](
-        topk_ids,
-        expert_route_ids,
-        expert_counts,
-        num_routes,
-        BLOCK_ROUTES=block_routes,
-        num_warps=4,
-    )
-    return expert_route_ids, expert_counts
 
 
 @triton.jit
@@ -216,6 +170,7 @@ def _stage1_kernel(
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
+    COMPACT_EXPERTS: tl.constexpr,
     hidden_size: tl.constexpr,
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -233,7 +188,17 @@ def _stage1_kernel(
     tile_idx = tl.program_id(0)
     problem_start = 0
 
-    for expert_id in range(num_experts):
+    if COMPACT_EXPERTS:
+        expert_iterations = tl.load(
+            expert_counts_ptr + num_experts + tl.minimum(num_experts, route_count)
+        )
+    else:
+        expert_iterations = num_experts
+    for expert_index in range(expert_iterations):
+        if COMPACT_EXPERTS:
+            expert_id = tl.load(expert_counts_ptr + num_experts + expert_index)
+        else:
+            expert_id = expert_index
         group_m = tl.load(expert_counts_ptr + expert_id)
         num_m_tiles = tl.cdiv(group_m, BLOCK_M)
         num_n_tiles = tl.cdiv(intermediate_size, BLOCK_N)
@@ -294,6 +259,7 @@ def _stage2_kernel(
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
+    COMPACT_EXPERTS: tl.constexpr,
     hidden_size: tl.constexpr,
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -307,7 +273,17 @@ def _stage2_kernel(
     tile_idx = tl.program_id(0)
     problem_start = 0
 
-    for expert_id in range(num_experts):
+    if COMPACT_EXPERTS:
+        expert_iterations = tl.load(
+            expert_counts_ptr + num_experts + tl.minimum(num_experts, route_count)
+        )
+    else:
+        expert_iterations = num_experts
+    for expert_index in range(expert_iterations):
+        if COMPACT_EXPERTS:
+            expert_id = tl.load(expert_counts_ptr + num_experts + expert_index)
+        else:
+            expert_id = expert_index
         group_m = tl.load(expert_counts_ptr + expert_id)
         num_m_tiles = tl.cdiv(group_m, BLOCK_M)
         num_n_tiles = tl.cdiv(hidden_size, BLOCK_N)
@@ -372,7 +348,14 @@ def _moe(
     if num_tokens == 0:
         return torch.empty_like(x)
 
-    expert_route_ids, expert_counts = _routing(topk_ids, num_experts)
+    routing = moe_expert_routing(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        StagePolicy(x.dtype, activation, sort_routes=False),
+        solution=None,
+        override=None,
+    )
     route_count = num_tokens * top_k
     intermediate = torch.empty(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
@@ -401,9 +384,10 @@ def _moe(
         x_desc,
         w13_desc,
         intermediate,
-        expert_route_ids,
-        expert_counts,
+        routing.route_ids,
+        routing.counts,
         num_tokens,
+        COMPACT_EXPERTS=routing.compact,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -423,9 +407,10 @@ def _moe(
         intermediate,
         w2_desc,
         route_output,
-        expert_route_ids,
-        expert_counts,
+        routing.route_ids,
+        routing.counts,
         num_tokens,
+        COMPACT_EXPERTS=routing.compact,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -437,7 +422,7 @@ def _moe(
         num_warps=4 if block_m == 16 else 8,
         num_stages=3,
     )
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, routing.route_weights, output)
     return output
 
 
@@ -487,6 +472,12 @@ def triton_bf16_precomputed_moe_apply(
         router_logits: Unused because routing must be precomputed.
         topk_weights: Route weights `[tokens, top_k]`.
         topk_ids: Expert ids `[tokens, top_k]`. Out-of-range ids contribute zero.
+            The per-expert route tables come from the ``moe.expert_routing``
+            operator (``moe_expert_routing``; ranked default
+            ``triton_moe_routing_full``, the canonical tables;
+            ``--kernel-override moe.expert_routing=triton_moe_routing_compact``
+            selects the compact active-expert traversal for admitted calls --
+            see the ``ops/moe/expert_routing.py`` module docstring).
         num_tokens_global: Unused; distributed expert parallelism is unsupported.
         max_num_tokens_per_gpu: Unused token-capacity hint.
         do_finalize: Must be true.

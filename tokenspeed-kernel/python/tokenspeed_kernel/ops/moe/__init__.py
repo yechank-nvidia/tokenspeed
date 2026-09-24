@@ -41,11 +41,13 @@ __all__ = [
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
     "moe_apply",
+    "moe_expert_routing",
     "moe_plan",
     "moe_process_weights",
     "moe_topk",
 ]
 
+from tokenspeed_kernel.ops.moe.expert_routing import moe_expert_routing  # noqa: E402
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
     latent_moe_decode_pipeline_available,
     latent_moe_expert_shared,
