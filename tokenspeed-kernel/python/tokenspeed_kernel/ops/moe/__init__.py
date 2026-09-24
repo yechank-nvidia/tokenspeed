@@ -44,6 +44,7 @@ __all__ = [
     "moe_group_mask",
     "moe_plan",
     "moe_process_weights",
+    "moe_route_epilogue",
     "moe_topk",
 ]
 
@@ -56,6 +57,7 @@ from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
+from tokenspeed_kernel.ops.moe.route_epilogue import moe_route_epilogue  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
     _moe_sigmoid_bias_topk,
 )
