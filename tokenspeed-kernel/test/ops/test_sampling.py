@@ -377,6 +377,66 @@ def test_fused_topk_topp_external_workspace(device: str) -> None:
     torch.testing.assert_close(auto, no_pdl, atol=0.0, rtol=0.0)
 
 
+def _tail_probabilities(rows: int, V: int, kept: int) -> torch.Tensor:
+    """Rows whose ``kept`` largest probabilities end with two values far below
+    the FP32 ulp of the kept mass (about 6e-8 near 1.0).
+
+    Every other kept value is an exact multiple of 2**-24 and the kept mass
+    stays below 1.0, so every FP32 partial sum of those values is exact in any
+    summation order and only the two tail values are absorbed. A cutoff scan
+    that compares FP32 prefix sums against the FP32 total therefore reaches
+    the total before the tail regardless of scan order; only a P >= 1
+    short-circuit keeps the whole kept set. The ``V - kept`` remainder is
+    distinct and strictly below the tail, so top-K = ``kept`` selects exactly
+    head + regular values + tail.
+    """
+    assert (kept - 3) * 2.0**-20 < 2.0**-7  # kept mass < 1.0: partial sums exact
+    head = torch.tensor([1.0 - 2.0**-7], dtype=torch.float64)
+    regular = torch.full((kept - 3,), 2.0**-20, dtype=torch.float64)
+    tail = torch.tensor([1.2e-8, 9.5e-9], dtype=torch.float64)
+    rest = 9.0e-9 - torch.arange(V - kept, dtype=torch.float64) * 1e-12
+    row = torch.cat((head, regular, tail, rest)).float()
+    return torch.stack([row.roll(3 * index) for index in range(rows)])
+
+
+@requires_nvidia
+@pytest.mark.parametrize("top_k", [_TOP_K_DISABLED, 128])
+def test_fused_topk_topp_keeps_sub_ulp_tail_at_top_p_one(
+    device: str, top_k: int
+) -> None:
+    """top_p = 1.0 requests no top-p truncation: every token of the top-K set
+    (the whole row for the sentinel) stays in the support even when its
+    probability is below the FP32 ulp of the running total.
+
+    The top-K prefix scan (mode 3.1) used to stop where the FP32 prefix sum
+    first reached the FP32 total, and the radix top-p threshold (mode 3.2)
+    used to land above the smallest probabilities; both dropped such tokens.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
+    bs, V = 2, 8192
+    kept = min(top_k, V)
+    probs = _tail_probabilities(bs, V, kept).to(device)
+    top_ks = torch.full((bs,), top_k, dtype=torch.int32, device=device)
+    top_ps = torch.ones(bs, dtype=torch.float32, device=device)
+
+    ours = fused_topk_topp_renorm(probs, top_ks, top_ps)
+    torch.cuda.synchronize()
+
+    # Expected: the ``kept`` largest entries of each row, renormalized.
+    keep = torch.zeros_like(probs, dtype=torch.bool)
+    keep.scatter_(1, torch.topk(probs, kept, dim=-1).indices, True)
+    ref = torch.where(keep, probs, torch.zeros_like(probs))
+    ref = ref / ref.sum(dim=-1, keepdim=True)
+
+    assert int((ours != 0).sum().item()) == bs * kept
+    torch.testing.assert_close(ours != 0, keep, atol=0, rtol=0)
+    torch.testing.assert_close(
+        ours.sum(dim=-1), torch.ones(bs, device=device), atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(ours, ref, atol=1e-5, rtol=1e-4)
+
+
 def test_gather_empty_batch(device: str) -> None:
     pool_rows = 16
     temp_p, top_k_p, top_p_p, min_p_p, seed_p, offsets_p = _make_pools(
