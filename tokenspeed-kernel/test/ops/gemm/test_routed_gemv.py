@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.gemm.routed_gemv import (
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -73,11 +74,10 @@ def _routed_cases():
 @pytest.mark.parametrize("shape,backend", _routed_cases())
 def test_dispatch_picks_the_measured_backend(shape, backend):
     m, n, k = shape
-    _select.cache_clear()
-    impl = _select(m, n, k, True, torch.bfloat16)
-    assert backend in getattr(
-        impl, "__name__", ""
-    ), f"M={m} N={n} K={k} resolved {impl} instead of the measured {backend}"
+    selected = _select(m, n, k, True, torch.bfloat16)
+    assert (
+        backend in selected.name
+    ), f"M={m} N={n} K={k} resolved {selected.name} instead of the measured {backend}"
 
 
 @pytest.mark.skipif(
@@ -262,16 +262,11 @@ def test_skinny_add3_unwarmed_capture_falls_back(monkeypatch):
 
 
 def test_unlisted_shapes_keep_the_generic_selection():
-    _select.cache_clear()
-    impl = _select(1, 999, 4096, True, torch.bfloat16)
-    assert "rowcta" in getattr(impl, "__name__", "")
-    impl = _select(4, 3216, 7168, True, torch.bfloat16)
-    assert "torch" in getattr(impl, "__name__", "")
+    assert "rowcta" in _select(1, 999, 4096, True, torch.bfloat16).name
+    assert "torch" in _select(4, 3216, 7168, True, torch.bfloat16).name
     # A width no call site produces.
-    impl = _select(3, 6289, 7168, True, torch.bfloat16)
-    assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(1, 2304, 1536, True, torch.bfloat16)
-    assert "rowcta" in getattr(impl, "__name__", "")
+    assert "torch" in _select(3, 6289, 7168, True, torch.bfloat16).name
+    assert "rowcta" in _select(1, 2304, 1536, True, torch.bfloat16).name
 
 
 def test_qwen38_route_keeps_unstable_shapes_on_fallback():
@@ -760,17 +755,20 @@ def test_fp32_decode_gemv_reduction_bounds(k):
 
 
 def test_decode_gemv_selection_respects_dtype():
-    from tokenspeed_kernel.ops.gemm.triton_gemv import (
-        torch_decode_gemv,
-        triton_rowcta_gemv,
-    )
+    """BF16 and FP32 each resolve to their own row-CTA registration; a dtype no
+    ``gemm.decode_gemv`` kernel is registered for is a selection error rather
+    than a silent torch fall-through now that the leaf is registry-selected."""
+    from tokenspeed_kernel.ops.gemm.triton_gemv import triton_rowcta_gemv
 
-    _select.cache_clear()
-    for dtype in (torch.bfloat16, torch.float32, torch.float16, torch.float32):
-        impl = _select(1, 999, 4096, True, dtype)
-        assert impl is (
-            torch_decode_gemv if dtype == torch.float16 else triton_rowcta_gemv
-        )
+    for dtype, name in (
+        (torch.bfloat16, "triton_rowcta_gemv"),
+        (torch.float32, "triton_rowcta_gemv_fp32"),
+    ):
+        selected = _select(1, 999, 4096, True, dtype)
+        assert selected.name == name
+        assert selected.impl is triton_rowcta_gemv
+    with pytest.raises(NoKernelFoundError):
+        _select(1, 999, 4096, True, torch.float16)
 
 
 @pytest.mark.parametrize("m", [2, 3, 8, 16, 32])
@@ -796,13 +794,16 @@ def test_fp32_decode_gemm_rows_selection_and_bounds():
         triton_rowcta_gemv,
     )
 
-    _select.cache_clear()
-    assert _select(1, 256, 5120, True, torch.float32) is triton_rowcta_gemv
+    assert _select(1, 256, 5120, True, torch.float32).impl is triton_rowcta_gemv
     for m in (2, 8, 32):
-        assert _select(m, 256, 5120, True, torch.float32) is triton_rowcta_gemm_fp32
-    assert _select(33, 256, 5120, True, torch.float32) is torch_decode_gemv
+        assert (
+            _select(m, 256, 5120, True, torch.float32).impl is triton_rowcta_gemm_fp32
+        )
+    assert _select(33, 256, 5120, True, torch.float32).impl is torch_decode_gemv
     # BF16 rows above one keep their own routing; the FP32 kernel is dtype-gated.
-    assert _select(8, 256, 5120, True, torch.bfloat16) is not triton_rowcta_gemm_fp32
+    assert (
+        _select(8, 256, 5120, True, torch.bfloat16).impl is not triton_rowcta_gemm_fp32
+    )
     x = torch.ones(8, 4097, device="cuda")
     weight = torch.ones(3, 4097, device="cuda")
     torch.testing.assert_close(

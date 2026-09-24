@@ -45,7 +45,11 @@ import threading
 from types import MappingProxyType
 
 import torch
-from tokenspeed_kernel.ops.gemm.triton_gemv import _select, torch_decode_gemv
+from tokenspeed_kernel.ops.gemm.triton_gemv import (
+    TORCH_DECODE_GEMV,
+    _select,
+    torch_decode_gemv,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -990,11 +994,25 @@ ADD3_ROUTE: MappingProxyType[tuple[int, int, int], tuple[int, int, int]] = (
 )
 
 
+def _selects_measured_leaf(m: int, n: int, k: int, dtype: torch.dtype) -> bool:
+    """Whether ``decode_gemv`` resolves this CUDA call to a leaf other than the
+    portable one -- the registry's answer, override included."""
+    return _select(m, n, k, True, dtype).name != TORCH_DECODE_GEMV
+
+
 def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether a measured decode kernel covers this call on this platform.
 
-    NVIDIA answers from :data:`MEASURED_ROUTE`. CDNA5 has no such table, so it
-    asks the registry, which holds the row-CTA and dense16 WMMA kernels and
+    NVIDIA admits a call from :data:`MEASURED_ROUTE` on sm100 and up, then
+    asks the registry which leaf ``decode_gemv`` would run for it: the
+    measured spec by ranking, or whatever the ``gemm.decode_gemv`` override
+    names. With the portable leaf forced
+    (``TOKENSPEED_KERNEL_OVERRIDE_GEMM_DECODE_GEMV=torch_decode_gemv``) this
+    answers False, so the linear layer keeps its reference path
+    (``tokenspeed_kernel.mm`` -> ``torch_mm``) rather than calling the
+    portable GEMV; the table term stays so unlisted M == 1 shapes are not
+    admitted by the generic row-CTA spec. CDNA5 has no table, so it asks the
+    registry directly, which holds the row-CTA and dense16 WMMA kernels and
     honors each spec's own capability gate -- the sm100+ backends above are
     filtered out there, so this cannot select a kernel ROCm does not have.
     Which of the two a call lands on is decided by their declared traits.
@@ -1023,7 +1041,7 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     m, k = x.shape
     n = weight.shape[0]
     if (m, n, k) in MEASURED_ROUTE and _is_routed_arch(x.device.index or 0):
-        return True
+        return _selects_measured_leaf(m, n, k, x.dtype)
 
     from tokenspeed_kernel.platform import current_platform
 
@@ -1031,7 +1049,7 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     # its own spec.
     if not current_platform().is_cdna5 or k < 256:
         return False
-    return _select(m, n, k, True, x.dtype) is not torch_decode_gemv
+    return _selects_measured_leaf(m, n, k, x.dtype)
 
 
 @functools.lru_cache(maxsize=8)
