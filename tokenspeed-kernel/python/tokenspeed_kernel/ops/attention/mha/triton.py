@@ -23,6 +23,7 @@ import torch
 from tokenspeed_kernel.ops.attention.mha._triton.context import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mha._triton.decode import (
     _triton_mha_decode_with_kvcache_impl,
+    grouped_decode_block_n,
 )
 from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
     _triton_mha_extend_with_kvcache_impl,
@@ -35,6 +36,21 @@ from tokenspeed_kernel.signature import format_signatures
 
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
+
+# Shared by the two paged-decode registrations below so that a name override
+# between them never changes the facade's trait filtering.
+_MHA_DECODE_SIGNATURES = format_signatures(
+    ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
+)
+_MHA_DECODE_TRAITS = {
+    "logit_cap": frozenset({False, True}),
+    "return_lse": frozenset({False}),
+    "sinks": frozenset({False, True}),
+    "sliding_window": frozenset({False, True}),
+}
+# Stage-1 KV tile pinned by ``triton_mha_decode_kv32``: the value the default
+# derivation yields on NVIDIA outside the SM100 BF16 / D128 / page-64 guard.
+_KV32_BLOCK_N = 32
 
 
 @register_kernel(
@@ -155,16 +171,9 @@ def triton_mha_extend_with_kvcache(
     name="triton_mha_decode_with_kvcache",
     solution="triton",
     capability=_PORTABLE_CAPABILITY,
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
-    ),
+    signatures=_MHA_DECODE_SIGNATURES,
     priority=Priority.PORTABLE,
-    traits={
-        "logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False}),
-        "sinks": frozenset({False, True}),
-        "sliding_window": frozenset({False, True}),
-    },
+    traits=_MHA_DECODE_TRAITS,
 )
 def triton_mha_decode_with_kvcache(
     q: torch.Tensor,
@@ -186,6 +195,11 @@ def triton_mha_decode_with_kvcache(
     *,
     decode_workspace: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Portable Triton paged decode with the default stage-1 KV tile.
+
+    The tile comes from :func:`grouped_decode_block_n` (128 on SM100 for BF16
+    128-wide heads on 64-token pages, otherwise 32; 16 for AMD heads >= 576).
+    """
     return _triton_mha_decode_with_kvcache_impl(
         q=q,
         k_cache=k_cache,
@@ -204,6 +218,43 @@ def triton_mha_decode_with_kvcache(
         k_scale=k_scale,
         v_scale=v_scale,
         enable_pdl=enable_pdl,
+        block_n=grouped_decode_block_n(q, k_cache, v_cache),
+    )
+
+
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="triton_mha_decode_kv32",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_MHA_DECODE_SIGNATURES,
+    # REFERENCE band: never auto-selected while triton_mha_decode_with_kvcache
+    # is registered; reached only by name (``override=`` or
+    # ``TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_MHA_DECODE_WITH_KVCACHE``).
+    priority=Priority.REFERENCE,
+    traits=_MHA_DECODE_TRAITS,
+)
+def triton_mha_decode_kv32(
+    *,
+    decode_workspace: torch.Tensor | None,
+    **kwargs,
+) -> torch.Tensor:
+    """Switch handle: the same host as ``triton_mha_decode_with_kvcache`` with
+    the stage-1 KV tile pinned to 32.
+
+    This is not a second implementation. It exists so the 32-token tile of
+    grouped decode is a registry entity that can be forced by name (A/B
+    against the SM100 128-tile default). Every keyword the facade passes is
+    forwarded to :func:`_triton_mha_decode_with_kvcache_impl`, which rejects
+    unsupported ones. ``decode_workspace`` is required, as on the default
+    registration. NVIDIA only: on AMD the default tile for heads >= 576 is 16,
+    so 32 is not the documented alternative there.
+    """
+    return _triton_mha_decode_with_kvcache_impl(
+        decode_workspace=decode_workspace,
+        block_n=_KV32_BLOCK_N,
+        **kwargs,
     )
 
 

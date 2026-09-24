@@ -440,6 +440,47 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+def grouped_decode_block_n(
+    q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> int:
+    """Return the default stage-1 KV tile (``BLOCK_N``) of grouped paged decode.
+
+    This is the only place that derives the tile from the platform and the
+    inputs. The launcher :func:`_decode_grouped_att_m_fwd` takes ``block_n``
+    explicitly and never re-derives it, so registered kernels decide what to
+    pass: ``triton_mha_decode_with_kvcache`` passes this value and
+    ``triton_mha_decode_kv32`` pins 32.
+
+    Args:
+        q: Query tensor ``[total_q, num_q_heads, head_dim]``.
+        k_cache: Paged key cache ``[num_pages, page_size, num_kv_heads, head_dim]``.
+        v_cache: Paged value cache
+            ``[num_pages, page_size, num_kv_heads, head_dim_v]``.
+
+    Returns:
+        128 on NVIDIA SM100 when q, k and v are all BF16 with 128-wide key and
+        value heads on 64-token pages (wider tiles reduce online-softmax
+        iterations); 16 on AMD for key heads of 576 or more (MI3xx shared
+        memory limit); 32 otherwise. Every value is a power of two of at
+        least 16, the launcher's contract.
+    """
+    platform = current_platform()
+    head_dim_k = k_cache.shape[-1]
+    head_dim_v = v_cache.shape[-1]
+    page_size = k_cache.shape[1]
+    if (
+        platform.is_nvidia
+        and platform.arch_version == ArchVersion(10, 0)
+        and q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+        and head_dim_k == head_dim_v == 128
+        and page_size == 64
+    ):
+        return 128
+    if platform.is_amd and head_dim_k >= 576:
+        return 16
+    return 32
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -456,26 +497,29 @@ def _decode_grouped_att_m_fwd(
     window_left,
     sm_scale,
     logit_cap,
+    block_n: int,
 ):
+    """Launch stage 1 of grouped (GQA/MQA/MLA) paged decode.
+
+    ``block_n`` is the stage-1 KV tile (the ``BLOCK_N`` constexpr) and is
+    passed through unchanged; the launcher derives nothing from the platform.
+    Callers take the default from :func:`grouped_decode_block_n` or pin a
+    value. It must be a power of two (``tl.arange``) of at least 16: the tile
+    is the K dimension of the stage-1 PV ``tl.dot`` (``p[BLOCK_H, BLOCK_N] @
+    v[BLOCK_N, BLOCK_DV]``), whose lower bound for 16-bit operands is 16 on
+    NVIDIA, and 16 is the smallest tile this host documents for AMD
+    (``matrix_instr_nonkdim=16``). Smaller values would only fail later inside
+    the Triton JIT, so they are rejected here before any launch.
+    """
     platform = current_platform()
 
-    BLOCK = 32
+    if block_n < 16 or block_n & (block_n - 1):
+        raise ValueError(
+            f"block_n must be a power of two >= 16 (stage-1 tl.dot lower bound), "
+            f"got {block_n}"
+        )
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
-
-    # Wider KV tiles reduce online-softmax iterations for SM100 BF16 heads.
-    if (
-        platform.is_nvidia
-        and platform.arch_version == ArchVersion(10, 0)
-        and q.dtype == k_buffer.dtype == v_buffer.dtype == torch.bfloat16
-        and Lk == Lv == 128
-        and page_size == 64
-    ):
-        BLOCK = 128
-
-    # MI3xx uses a smaller block size for large heads to stay within shmem limits.
-    if platform.is_amd and Lk >= 576:
-        BLOCK = 16
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -533,7 +577,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
+        BLOCK_N=block_n,
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
@@ -744,7 +788,10 @@ def decode_attention_fwd_grouped(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    *,
+    block_n: int,
 ):
+    """Grouped (GQA/MQA/MLA) decode: stage 1 with KV tile ``block_n``, then stage 2."""
     _decode_grouped_att_m_fwd(
         q,
         k_buffer,
@@ -761,6 +808,7 @@ def decode_attention_fwd_grouped(
         window_left,
         sm_scale,
         logit_cap,
+        block_n,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -795,7 +843,16 @@ def decode_attention_fwd(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    *,
+    block_n: int,
 ):
+    """Paged decode entry shared by the registered Triton kernels.
+
+    ``block_n`` is the stage-1 KV tile of the grouped launcher, which serves
+    every GQA/MQA/MLA layout (``kv_group_num > 1``). The single-KV-head
+    launcher (``kv_group_num == 1``) keeps its own fixed tile and does not
+    consume ``block_n``.
+    """
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] == cache_seqlens.shape[0] * max_seqlen_q
     assert q.shape[0] <= attn_logits.shape[0]
@@ -843,6 +900,7 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
+            block_n=block_n,
         )
 
 
@@ -864,8 +922,14 @@ def _triton_mha_decode_with_kvcache_impl(
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
     *,
+    block_n: int,
     decode_workspace: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Shared host of the registered Triton paged-decode kernels.
+
+    ``block_n`` is the stage-1 KV tile of the grouped launcher; the registered
+    kernel that calls this host chooses it (see :func:`grouped_decode_block_n`).
+    """
     if decode_workspace is not None:
         if not isinstance(decode_workspace, torch.Tensor):
             raise TypeError("decode_workspace must be a tensor or None")
@@ -921,5 +985,6 @@ def _triton_mha_decode_with_kvcache_impl(
         sm_scale=softmax_scale,
         logit_cap=logit_cap,
         sinks=sinks,
+        block_n=block_n,
     )
     return out

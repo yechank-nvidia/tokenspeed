@@ -135,7 +135,7 @@ def test_portable_wrapper_reuses_workspace_and_fallback_uses_same_policy(
         namespace,
     )
     with pytest.raises(TypeError, match="decode_workspace"):
-        wrapper(**inputs)
+        wrapper(**inputs, block_n=32)
     workspace = workspace_module.prepare_mha_decode_workspace(5, "cpu")[:2]
     expected = workspace.clone()
     for method in ("cpu", "item", "tolist"):
@@ -145,16 +145,21 @@ def test_portable_wrapper_reuses_workspace_and_fallback_uses_same_policy(
             Mock(side_effect=AssertionError("Forward read workspace values")),
         )
     for _ in range(2):
-        assert wrapper(**inputs, decode_workspace=workspace).shape == inputs["q"].shape
+        assert (
+            wrapper(**inputs, block_n=32, decode_workspace=workspace).shape
+            == inputs["q"].shape
+        )
     prepare.assert_not_called()
     assert all(call.args[8] is workspace for call in launched.call_args_list)
     assert torch.equal(workspace, expected)
-    wrapper(**inputs, decode_workspace=None)
-    wrapper(**inputs, decode_workspace=None)
+    wrapper(**inputs, block_n=32, decode_workspace=None)
+    wrapper(**inputs, block_n=32, decode_workspace=None)
     assert prepare.call_count == 2
     first, second = [call.args[8] for call in launched.call_args_list[-2:]]
     assert first.data_ptr() != second.data_ptr()
     assert torch.equal(first, expected) and torch.equal(second, expected)
+    # The workspace path never perturbs the caller's explicit stage-1 tile.
+    assert all(call.kwargs["block_n"] == 32 for call in launched.call_args_list)
 
 
 @pytest.mark.parametrize(
@@ -183,8 +188,8 @@ def test_portable_wrapper_rejects_invalid_workspace_before_kernel(
             "decode_attention_fwd": launched,
         },
     )
-    with pytest.raises((ValueError, TypeError)):
-        wrapper(**inputs, decode_workspace=choices[invalid])
+    with pytest.raises((ValueError, TypeError), match="decode_workspace"):
+        wrapper(**inputs, block_n=32, decode_workspace=choices[invalid])
     launched.assert_not_called()
 
 
@@ -234,14 +239,24 @@ def test_public_facade_requires_and_forwards_workspace_without_dispatch_change(i
 
 def test_portable_adapter_forwards_required_workspace(inputs):
     implementation = Mock(return_value=object())
+    # The registered adapter derives its stage-1 KV tile once through
+    # ``grouped_decode_block_n`` (_triton/decode.py) and forwards it as the
+    # host's required ``block_n``; the host has no default for it.
+    derive = Mock(return_value=128)
     adapter = _function(
         MHA / "triton.py",
         "triton_mha_decode_with_kvcache",
-        {"torch": torch, "_triton_mha_decode_with_kvcache_impl": implementation},
+        {
+            "torch": torch,
+            "_triton_mha_decode_with_kvcache_impl": implementation,
+            "grouped_decode_block_n": derive,
+        },
     )
     workspace = object()
     assert adapter(**inputs, decode_workspace=workspace) is implementation.return_value
     assert implementation.call_args.kwargs["decode_workspace"] is workspace
+    derive.assert_called_once_with(inputs["q"], inputs["k_cache"], inputs["v_cache"])
+    assert implementation.call_args.kwargs["block_n"] == derive.return_value
     with pytest.raises(TypeError, match="decode_workspace"):
         adapter(**inputs)
 
