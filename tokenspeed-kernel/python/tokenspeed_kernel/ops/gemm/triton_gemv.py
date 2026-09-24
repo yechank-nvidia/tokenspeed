@@ -36,15 +36,29 @@ a SIMT GEMM plus a split-K reduction.
 
 from __future__ import annotations
 
-import functools
-
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.signature import (
+    FormatSignature,
+    dense_tensor_format,
+    format_signature,
+)
 
-__all__ = ["decode_gemv", "triton_rowcta_gemm_fp32", "triton_rowcta_gemv"]
+__all__ = [
+    "TORCH_DECODE_GEMV",
+    "decode_gemv",
+    "triton_rowcta_gemm_fp32",
+    "triton_rowcta_gemv",
+]
+
+# Registered name of the portable ``gemm.decode_gemv`` leaf. It is the OFF
+# target of the operator's override switch
+# (``TOKENSPEED_KERNEL_OVERRIDE_GEMM_DECODE_GEMV=torch_decode_gemv``), and the
+# measured BF16 route tests the selected leaf against it by name.
+TORCH_DECODE_GEMV = "torch_decode_gemv"
 
 
 @triton.jit
@@ -157,6 +171,20 @@ _BF16_SIG = frozenset(
         )
     }
 )
+_FP32_SIG = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.float32),
+            weight=dense_tensor_format(torch.float32),
+        )
+    }
+)
+# The only two signatures the operator serves, keyed by dtype so ``_select``
+# does not rebuild a FormatSignature on every eager call.
+_SIGNATURE_BY_DTYPE: dict[torch.dtype, FormatSignature] = {
+    torch.bfloat16: next(iter(_BF16_SIG)),
+    torch.float32: next(iter(_FP32_SIG)),
+}
 
 
 @register_kernel(
@@ -164,14 +192,7 @@ _BF16_SIG = frozenset(
     "decode_gemv",
     name="triton_rowcta_gemv_fp32",
     solution="triton",
-    signatures=frozenset(
-        {
-            format_signature(
-                x=dense_tensor_format(torch.float32),
-                weight=dense_tensor_format(torch.float32),
-            )
-        }
-    ),
+    signatures=_FP32_SIG,
     traits={"m": frozenset({1})},
     priority=Priority.SPECIALIZED,
 )
@@ -230,14 +251,7 @@ def triton_rowcta_gemv(
     "decode_gemv",
     name="triton_rowcta_gemm_fp32",
     solution="triton",
-    signatures=frozenset(
-        {
-            format_signature(
-                x=dense_tensor_format(torch.float32),
-                weight=dense_tensor_format(torch.float32),
-            )
-        }
-    ),
+    signatures=_FP32_SIG,
     traits={"m": frozenset(range(2, 33))},
     priority=Priority.SPECIALIZED,
 )
@@ -324,12 +338,16 @@ def gluon_wmma_dense_gemv_gfx1250(
     return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out)
 
 
+# Portable leaf for both dtypes the operator serves: BF16 dense projections
+# and the FP32 expert router. Registering the FP32 signature here gives every
+# FP32 shape a candidate, so ``select_kernel`` resolves M >= 33 to this leaf
+# by ranking instead of by an in-function fall-through.
 @register_kernel(
     "gemm",
     "decode_gemv",
-    name="torch_decode_gemv",
+    name=TORCH_DECODE_GEMV,
     solution="torch",
-    signatures=_BF16_SIG,
+    signatures=_BF16_SIG | _FP32_SIG,
     traits={},
     priority=Priority.PORTABLE,
 )
@@ -343,35 +361,50 @@ def torch_decode_gemv(
     return x @ weight.t()
 
 
-@functools.lru_cache(maxsize=64)
-def _select(m: int, n: int, k: int, on_cuda: bool, dtype: torch.dtype):
-    if not on_cuda:
-        return torch_decode_gemv
-    from tokenspeed_kernel.platform import current_platform
-    from tokenspeed_kernel.registry import KernelRegistry
-    from tokenspeed_kernel.selection import (
-        spec_matches_shape_traits,
-        spec_matches_traits,
-    )
+def _select(
+    m: int, n: int, k: int, on_cuda: bool, dtype: torch.dtype
+) -> SelectedKernel:
+    """Resolve the ``gemm.decode_gemv`` leaf for one ``[M, K] @ [N, K].T`` call.
 
-    reg = KernelRegistry.get()
-    # platform= makes the registry honor each spec's capability gate; without
-    # it an arch-gated spec (the measured sm103 route) would match anywhere.
-    traits = {"m": m, "n": n, "k": k}
-    for spec in reg.get_for_operator(
-        "gemm",
-        "decode_gemv",
-        platform=current_platform(),
-        format_signature=format_signature(
+    Non-CUDA inputs have no kernel platform and stay on the portable leaf.
+    CUDA inputs go through :func:`select_kernel` with the call's dtype
+    signature and ``(m, n, k)`` shape traits, so the operator's override
+    (``TOKENSPEED_KERNEL_OVERRIDE_GEMM_DECODE_GEMV`` or
+    :func:`~tokenspeed_kernel.selection.kernel_override`), verbose logging and
+    selection listeners all apply, and the registry's selection cache holds the
+    result per shape. Ranking is priority order under the same platform,
+    signature and trait filters the specs declare; no ``gemm`` oracle exists,
+    so the highest-priority admitted spec wins and the portable leaf is the
+    lowest-priority candidate for every BF16 and FP32 shape.
+
+    Args:
+        m/n/k: the projection extents.
+        on_cuda: whether ``x`` lives on a CUDA (or ROCm) device.
+        dtype: the shared dtype of ``x`` and ``weight``.
+
+    Returns:
+        The :class:`SelectedKernel` to call as ``kernel(x, weight, out)``.
+
+    Raises:
+        NoKernelFoundError: for a CUDA dtype no ``gemm.decode_gemv`` kernel is
+            registered for (only BF16 and FP32 are).
+    """
+    if not on_cuda:
+        return SelectedKernel(name=TORCH_DECODE_GEMV, impl=torch_decode_gemv)
+    signature = _SIGNATURE_BY_DTYPE.get(dtype)
+    if signature is None:
+        # Unregistered dtype: build its signature so ``select_kernel`` raises
+        # ``NoKernelFoundError`` naming it.
+        signature = format_signature(
             x=dense_tensor_format(dtype),
             weight=dense_tensor_format(dtype),
-        ),
-    ):
-        if spec_matches_traits(spec, traits) and spec_matches_shape_traits(
-            spec, traits
-        ):
-            return reg.get_impl(spec.name)
-    return torch_decode_gemv
+        )
+    return select_kernel(
+        "gemm",
+        "decode_gemv",
+        signature,
+        traits={"m": m, "n": n, "k": k},
+    )
 
 
 def decode_gemv(
@@ -381,10 +414,14 @@ def decode_gemv(
 ) -> torch.Tensor:
     """``x @ weight.T`` with registry-selected decode kernels.
 
-    Selection is cached per (M, N, K, device kind, dtype); the shape traits keep
-    the specialized kernels inside their validated envelope and everything
-    else routes to the portable fallback. Contiguous single-row FP32 GPU inputs
-    use FP32 products and accumulation independently of Torch matmul precision.
+    Contiguous same-dtype CUDA inputs are dispatched through
+    :func:`select_kernel` (see :func:`_select`): the shape traits keep the
+    specialized kernels inside their validated envelope, everything else ranks
+    down to the portable leaf, and ``TOKENSPEED_KERNEL_OVERRIDE_GEMM_DECODE_GEMV``
+    forces one leaf by name for every shape. Layout mismatches and non-CUDA
+    inputs take the portable leaf directly. Contiguous single-row FP32 GPU
+    inputs use FP32 products and accumulation independently of Torch matmul
+    precision.
     """
     expected = (x.shape[0], weight.shape[0])
     if out is not None:
