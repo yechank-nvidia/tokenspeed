@@ -20,24 +20,22 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import (
+    prepare_topk_topp_renorm,
+    resolve_topk_topp_renorm_override,
+    select_topk_topp_renorm,
+    topk_topp_renorm_rank_deterministic,
+)
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
 )
-from tokenspeed_kernel.ops.sampling.cuda import (
-    fused_topk_topp_available as _FUSED_TOPK_TOPP_AVAILABLE,
-)
-from tokenspeed_kernel.ops.sampling.cuda import (
-    fused_topk_topp_prepare,
-    fused_topk_topp_renorm,
-)
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
-    top_k_renorm_prob,
     top_k_top_p_sampling_from_probs,
-    top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.platform import pdl_enabled
@@ -58,12 +56,17 @@ from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs_torch,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.selection import SelectedKernel
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+logger = get_colorful_logger(__name__)
 
 
 class FlashInferSamplingBackend(SamplingBackend):
@@ -75,6 +78,12 @@ class FlashInferSamplingBackend(SamplingBackend):
     keeping the hot path to 2 kernels. Requests asking for min_p, penalties,
     or logit_bias are silently ignored; use `flashinfer_full` if any of those
     matter for the workload.
+
+    The verify() top-k/top-p renormalizer is bound once at init through the
+    registry operator ``sampling.topk_topp_renorm`` (fused CUDA kernel by
+    default, the FlashInfer pair by override) and the TP broadcast rule for
+    the verify outputs is read from the selected spec; see
+    ``_init_topk_topp_renorm``.
     """
 
     _HAS_POOL_STATE = True
@@ -86,10 +95,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
-        if _FUSED_TOPK_TOPP_AVAILABLE:
-            # Pre-create the fused renorm side stream: cudaStreamCreate is
-            # illegal inside capture, and verify() runs from the captured graph.
-            fused_topk_topp_prepare(config.device)
+        self._init_topk_topp_renorm(config)
 
     def _init_dp_sampling(self, config: SamplingBackendConfig) -> None:
         self._dp_tp_group = config.tp_group
@@ -203,6 +209,35 @@ class FlashInferSamplingBackend(SamplingBackend):
         # gives per-step uniqueness independent of the torch.Generator.
         self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._cpu_generator_per_slot[0] = self._capture_gen
+
+    def _init_topk_topp_renorm(self, config: SamplingBackendConfig) -> None:
+        """Bind the verify() top-k/top-p renormalizer before any CUDA-graph capture.
+
+        The kernel is selected through the registry operator
+        ``sampling.topk_topp_renorm``, so the registry override
+        ``TOKENSPEED_KERNEL_OVERRIDE_SAMPLING_TOPK_TOPP_RENORM=NAME`` (set
+        per rank) picks the arm by name; the deprecated
+        ``TS_DISABLE_FUSED_TOPK_TOPP=1`` is an alias of
+        ``flashinfer_topk_topp_renorm`` that warns once and refuses
+        to silently outrank a different explicit override. The selection is
+        fixed here and immutable afterwards: verify() runs from the captured
+        graph, the TP broadcast rule for its outputs is the selected spec's
+        ``rank_deterministic`` trait, and the kernel's side stream (if any)
+        must be created outside capture.
+        """
+        override = resolve_topk_topp_renorm_override(os.environ)
+        self._topk_topp_renorm: SelectedKernel = select_topk_topp_renorm(
+            probs_dtype=torch.float32, solution=None, override=override
+        )
+        self._topk_topp_rank_deterministic: bool = topk_topp_renorm_rank_deterministic(
+            self._topk_topp_renorm.name
+        )
+        prepare_topk_topp_renorm(self._topk_topp_renorm.name, config.device)
+        logger.info(
+            f"sampling.topk_topp_renorm -> {self._topk_topp_renorm.name} "
+            f"(rank_deterministic={self._topk_topp_rank_deterministic}, "
+            f"override={override!r})"
+        )
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         self._temperature_pool[pool_idx].fill_(float(sp.temperature))
@@ -467,22 +502,13 @@ class FlashInferSamplingBackend(SamplingBackend):
             logits,
             temperature=temperatures,
         )
-        if _FUSED_TOPK_TOPP_AVAILABLE:
-            # Fused replacement for the back-to-back top_k_renorm_prob +
-            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-            # K = 1<<30 in top_ks routes per-row through the radix top-p
-            # only path. Availability decided once in
-            # tokenspeed_kernel.ops.sampling.cuda.
-            target_probs = fused_topk_topp_renorm(
-                target_probs,
-                top_ks,
-                top_ps,
-            )
-        else:
-            target_probs = top_k_renorm_prob(target_probs, top_ks)
-            target_probs = top_p_renorm_prob(
-                target_probs, top_ps, is_deterministic=True
-            )
+        # Top-k then top-p renormalization through the kernel bound at init
+        # (registry operator sampling.topk_topp_renorm): fused_topk_topp_renorm
+        # replaces the back-to-back top_k_renorm_prob +
+        # top_p_renorm_prob(is_deterministic=True) pair that
+        # flashinfer_topk_topp_renorm runs literally. Sentinel K = 1<<30 in
+        # top_ks routes per-row through the top-p only path.
+        target_probs = self._topk_topp_renorm(target_probs, top_ks, top_ps)
         target_probs = target_probs.reshape(bs, n, -1)
 
         chain_speculative_sampling_target_only(
@@ -535,13 +561,14 @@ class FlashInferSamplingBackend(SamplingBackend):
                     : effective_bs * n
                 ]
         # TP-rank sync: rank 0 wins on the full verify-output triple.
-        # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
-        # knob and produces non-bit-identical results across ranks (sub-ulp
-        # FP accumulation order).
-        # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
-        # fused top-k + top-p is bit-identical across ranks and does not need
-        # a broadcast.
-        elif pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE:
+        # Load-bearing: the rule is the bound kernel's rank_deterministic
+        # trait, read once at init. flashinfer top_k_renorm_prob has no
+        # is_deterministic knob and produces non-bit-identical results across
+        # ranks (sub-ulp FP accumulation order), so its arm always broadcasts.
+        # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL, a
+        # rank-deterministic kernel (the fused top-k + top-p) is bit-identical
+        # across ranks and does not need a broadcast.
+        elif pdl_enabled() or not self._topk_topp_rank_deterministic:
             self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:
