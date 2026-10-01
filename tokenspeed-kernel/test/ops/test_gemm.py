@@ -253,6 +253,38 @@ def test_decode_gemv_writes_preallocated_output() -> None:
     torch.testing.assert_close(out, x @ weight.t())
 
 
+class _CudaOperand:
+    """The attributes use_decode_gemv() reads from a contiguous CUDA tensor."""
+
+    is_cuda = True
+    ndim = 2
+    dtype = torch.bfloat16
+
+    def __init__(self, *shape: int) -> None:
+        self.shape = torch.Size(shape)
+
+    def is_contiguous(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize("platform_fixture", ("mi350_platform", "mi450_platform"))
+def test_use_decode_gemv_selects_with_dtypes_on_amd(
+    monkeypatch, request, platform_fixture
+) -> None:
+    from tokenspeed_kernel.ops.gemm import triton_gemv
+
+    platform = request.getfixturevalue(platform_fixture)
+    select = Mock(return_value=triton_gemv.triton_rowcta_gemv)
+    monkeypatch.setattr(triton_gemv, "current_platform", lambda: platform)
+    monkeypatch.setattr(
+        triton_gemv, "flashinfer_joint_bf16_supported", lambda *_: False
+    )
+    monkeypatch.setattr(triton_gemv, "_select", select)
+
+    assert triton_gemv.use_decode_gemv(_CudaOperand(4, 7168), _CudaOperand(6288, 7168))
+    select.assert_called_once_with(4, 6288, 7168, True, torch.bfloat16, torch.bfloat16)
+
+
 def test_linear_attnres_partials_portable_composition() -> None:
     torch.manual_seed(13)
     hidden = torch.randn(2, 6, dtype=torch.bfloat16)
