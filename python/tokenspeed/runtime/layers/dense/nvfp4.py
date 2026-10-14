@@ -28,7 +28,8 @@ from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import (
     prepare_nvfp4_a16_weights as kernel_prepare_nvfp4_a16_weights,
 )
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.quantization import quantize_nvfp4
+from tokenspeed_kernel.platform import pdl_enabled
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
@@ -193,7 +194,12 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             output_dtype = torch.bfloat16
 
         else:
-            x_fp4, x_scale = fp4_quantize(x, layer.input_scale_inv)
+            x_fp4, x_scale = quantize_nvfp4(
+                x,
+                scale_layout="swizzled",
+                enable_pdl=pdl_enabled(),
+                inverse_scale=layer.input_scale_inv,
+            )
             output_dtype = x.dtype
 
         kernel_override = layer.override_kernel_name

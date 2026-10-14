@@ -547,3 +547,40 @@ def test_quantize_nvfp4_shape_and_scale(
     assert out.shape[:-1] == x.shape[:-1]
     assert out.shape[-1] == x.shape[-1] // 2
     assert scale.numel() > 0
+
+
+@pytest.mark.parametrize("scale_layout", ["linear", "swizzled"])
+def test_quantize_nvfp4_uses_an_inverse_scale_as_given(
+    device: str,
+    scale_layout: str,
+    require,
+) -> None:
+    """``inverse_scale`` reaches FlashInfer's quantizer unchanged: the op's
+    output equals a direct call with that global scale, bit for bit."""
+    require("quantization", "nvfp4", "flashinfer", torch.bfloat16, "x")
+    from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+
+    torch.manual_seed(7)
+    x = torch.randn(16, 256, device=device, dtype=torch.bfloat16)
+    # 1 / 0.3 is not a float32 value, so a second inversion would round.
+    inverse_scale = torch.tensor([1 / 0.3], device=device, dtype=torch.float32)
+    out, scale = quantize_nvfp4(
+        x, scale_layout=scale_layout, inverse_scale=inverse_scale
+    )
+    expected_out, expected_scale = fp4_quantize(
+        x,
+        inverse_scale,
+        is_sf_swizzled_layout=scale_layout == "swizzled",
+        enable_pdl=False,
+    )
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(out, expected_out)
+    assert _bitwise_equal(scale, expected_scale)
+
+
+def test_quantize_nvfp4_takes_one_scale_form() -> None:
+    x = torch.empty(16, 256, dtype=torch.bfloat16)
+    one = torch.ones(1)
+    with pytest.raises(ValueError, match="scale or inverse_scale, not both"):
+        quantize_nvfp4(x, scale=one, inverse_scale=one)

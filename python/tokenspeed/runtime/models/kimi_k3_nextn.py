@@ -36,6 +36,8 @@ import logging
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.activation import sigmoid_mul
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
@@ -57,7 +59,6 @@ from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMoE,
     create_kimi_linear_moe,
     prepare_k3_all_reduce_buffers,
-    sigmoid_mul,
 )
 from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
 from tokenspeed.runtime.utils import add_prefix
@@ -106,7 +107,7 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
         if gate is not None:
             if attn_output.shape[0] != gate.shape[0]:
                 gate = gate.index_select(0, ctx.gather_ids)
-            attn_output = sigmoid_mul(attn_output, gate)
+            attn_output = sigmoid_mul(attn_output, gate, enable_pdl=pdl_enabled())
         output, _ = self.o_proj(attn_output)
         return output
 

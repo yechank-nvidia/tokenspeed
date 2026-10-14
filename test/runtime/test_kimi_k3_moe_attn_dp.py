@@ -311,14 +311,14 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     gathers = iter([*activation_payloads, ("AG_ids", ids), ("AG_weights", weights)])
     quant_scale = torch.tensor(0.125)
 
-    def quantize(tensor, scale, *, is_sf_swizzled_layout, enable_pdl):
+    def quantize(tensor, *, scale_layout, enable_pdl, inverse_scale):
         events.append("quantize")
-        assert scale is quant_scale and not is_sf_swizzled_layout
+        assert inverse_scale is quant_scale and scale_layout == "linear"
         torch.testing.assert_close(tensor, latent[rank, :rows])
         return packed[rank, :rows], scales[rank, :rows]
 
     quantizer = mock.Mock(side_effect=quantize)
-    monkeypatch.setattr(kimi_k3, "fp4_quantize", quantizer)
+    monkeypatch.setattr(kimi_k3, "quantize_nvfp4", quantizer)
 
     def gather(tensor, group, *, dim):
         name, expected = next(gathers)
@@ -592,7 +592,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         torch.ones(rows, 1, dtype=torch.uint8),
     )
     quantize = mock.Mock(return_value=payload)
-    monkeypatch.setattr(kimi_k3, "fp4_quantize", quantize)
+    monkeypatch.setattr(kimi_k3, "quantize_nvfp4", quantize)
     for name in ("all_gather", "reduce_scatter", "all_reduce"):
         monkeypatch.setattr(kimi_k3, name, mock.Mock(side_effect=AssertionError(name)))
 

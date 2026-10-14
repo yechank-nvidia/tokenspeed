@@ -397,6 +397,8 @@ def quantize_nvfp4(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    inverse_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize x to packed NVFP4.
 
@@ -404,7 +406,8 @@ def quantize_nvfp4(
     The quantized output is usually shaped [M, K/2].
 
     scale is the actual input scale. Backend adapters should handle any
-    backend-specific inverse-scale convention internally.
+    backend-specific inverse-scale convention internally. A caller that
+    already holds ``1 / scale`` passes it as ``inverse_scale`` instead.
 
     Args:
         x: Input tensor.
@@ -414,21 +417,32 @@ def quantize_nvfp4(
         enable_pdl: Whether to request Programmatic Dependent Launch support.
         override: Optional exact kernel name or solution override.
         solution: Optional registered solution to select.
+        inverse_scale: Optional FP32 ``[1]`` tensor holding ``1 / scale``,
+            computed once by the caller (for example at weight loading). The
+            kernel uses it as given, so no division runs per call. Requires a
+            kernel with the ``inverse_scale`` feature. Give ``scale`` or
+            ``inverse_scale``, not both.
 
     Returns:
         Tuple of packed NVFP4 tensor and scale-factor tensor.
 
     """
 
+    if scale is not None and inverse_scale is not None:
+        raise ValueError("quantize_nvfp4 takes scale or inverse_scale, not both")
+    has_scale = scale is not None or inverse_scale is not None
     traits = {
         "scale_layout": scale_layout,
-        "has_scale": scale is not None,
+        "has_scale": has_scale,
     }
+    # Each option the call uses must be one the kernel implements.
+    features = frozenset({"inverse_scale"}) if inverse_scale is not None else None
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",
         "nvfp4",
         signature,
+        features=features,
         traits=traits,
         solution=solution,
         override=override,
@@ -436,7 +450,7 @@ def quantize_nvfp4(
     shape_params = {
         "shape": tuple(x.shape),
         "scale_layout": scale_layout,
-        "has_scale": scale is not None,
+        "has_scale": has_scale,
     }
     ShapeCapture.get().record(
         "quantization", "nvfp4", kernel.name, x.dtype, shape_params
@@ -444,11 +458,14 @@ def quantize_nvfp4(
     with kernel_scope(
         "quantization", "nvfp4", x.dtype, kernel_name=kernel.name, **shape_params
     ):
+        # Only a kernel with the inverse_scale feature takes the keyword.
+        extra = {} if inverse_scale is None else {"inverse_scale": inverse_scale}
         return kernel(
             x,
             scale=scale,
             scale_layout=scale_layout,
             enable_pdl=enable_pdl,
+            **extra,
         )
 
 

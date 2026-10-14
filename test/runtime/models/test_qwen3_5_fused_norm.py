@@ -328,9 +328,9 @@ def test_decoder_layer_hands_each_projection_its_own_quant(
         return run
 
     monkeypatch.setattr(layernorm, "add_rmsnorm", recording_add_rmsnorm)
-    fp4_quantize = counting("nvfp4", dense_nvfp4.fp4_quantize)
-    monkeypatch.setattr(dense_nvfp4, "fp4_quantize", fp4_quantize)
-    monkeypatch.setattr(qwen3_5_moe, "fp4_quantize", fp4_quantize)
+    quantize_nvfp4 = counting("nvfp4", dense_nvfp4.quantize_nvfp4)
+    monkeypatch.setattr(dense_nvfp4, "quantize_nvfp4", quantize_nvfp4)
+    monkeypatch.setattr(qwen3_5_moe, "quantize_nvfp4", quantize_nvfp4)
     monkeypatch.setattr(
         dense_fp8, "quantize_fp8", counting("fp8", dense_fp8.quantize_fp8)
     )

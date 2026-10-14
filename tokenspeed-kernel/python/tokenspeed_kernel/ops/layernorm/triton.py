@@ -5,7 +5,13 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
 
@@ -319,6 +325,29 @@ def rmsnorm(
     if residual is None:
         return out
     return out, residual_out
+
+
+@register_kernel(
+    "layernorm",
+    "plain_rmsnorm",
+    name="triton_plain_rmsnorm",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_plain_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    out: torch.Tensor | None,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """``rmsnorm`` without a residual: one launch of ``_rmsnorm_kernel``."""
+    return rmsnorm(x, weight, eps, out=out, enable_pdl=enable_pdl)
 
 
 @triton.jit

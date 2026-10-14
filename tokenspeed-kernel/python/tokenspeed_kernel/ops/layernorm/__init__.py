@@ -38,6 +38,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     reference_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _platform = current_platform()
 
@@ -96,6 +99,60 @@ def rmsnorm(
             raise ValueError("rmsnorm does not support residual and out together")
         return _rmsnorm(x, weight, eps, residual=residual)
     return _rmsnorm(x, weight, eps, out=out)
+
+
+def plain_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    out: torch.Tensor | None = None,
+    # kernel options
+    enable_pdl: bool,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """RMSNorm without a residual, through the kernel registry.
+
+    ``rmsnorm`` above picks a library kernel by platform. This op selects a
+    registered kernel: the Triton RMSNorm on NVIDIA and AMD, which computes the
+    mean of squares, the normalization and the weight multiply in FP32 and
+    rounds once to ``x``'s dtype at the store.
+
+    Args:
+        x: ``[..., hidden_size]`` input. 2-D rows may be strided with a unit
+            last stride.
+        weight: ``[hidden_size]`` affine weight.
+        eps: Epsilon added to the mean of squares.
+        out: Optional contiguous output shaped like ``x``.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+        override: Optional exact registered kernel override.
+        solution: Optional restriction to a registered backend family.
+
+    Returns:
+        ``out``, or a new tensor shaped like ``x``.
+    """
+    signature = format_signature(x=dense_tensor_format(x.dtype))
+    kernel = select_kernel(
+        "layernorm",
+        "plain_rmsnorm",
+        signature,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {"shape": tuple(x.shape)}
+    ShapeCapture.get().record(
+        "layernorm", "plain_rmsnorm", kernel.name, x.dtype, shape_params
+    )
+    with kernel_scope(
+        "layernorm",
+        "plain_rmsnorm",
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(x, weight, eps, out=out, enable_pdl=enable_pdl)
 
 
 def qk_rmsnorm(
@@ -223,6 +280,7 @@ __all__ = [
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",
     "nvfp4_copy_supported",
+    "plain_rmsnorm",
     "qk_rmsnorm",
     "reference_rmsnorm",
     "rmsnorm",

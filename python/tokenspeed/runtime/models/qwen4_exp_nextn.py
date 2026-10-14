@@ -27,7 +27,8 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation import sigmoid_mul
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -134,7 +135,7 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
                 topk_indices=topk_indices.index_select(0, rows),
             )
         if gate is not None:
-            sigmoid_mul(output, gate.index_select(0, rows))
+            sigmoid_mul(output, gate.index_select(0, rows), enable_pdl=pdl_enabled())
         return output
 
     def forward(self, *args, **kwargs):

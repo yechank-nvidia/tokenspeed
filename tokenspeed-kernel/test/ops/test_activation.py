@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.activation as activation
 import tokenspeed_kernel.ops.activation.triton as activation_triton
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
@@ -200,6 +201,34 @@ def test_sigmoid_mul_launch_arguments(
         "BLOCK_SIZE": 1024,
         "ENABLE_PDL": False,
     }
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("head_bias", [False, True])
+def test_sigmoid_mul_op_launches_as_the_direct_call(
+    head_bias: bool, enable_pdl: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host side only, with the launch recorded: the registered op runs the
+    Triton kernel with the launch a direct call makes, including the caller's
+    ``enable_pdl`` and, when given, the head bias."""
+    launches = []
+
+    class _Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((grid, args, kwargs))
+
+    monkeypatch.setattr(activation_triton, "_sigmoid_mul_kernel", _Kernel())
+    gate = _headed_gate("strided", 3, 4, 64, torch.bfloat16, "cpu")
+    x = torch.randn(3, 4 * 64, dtype=torch.bfloat16)
+    bias = torch.randn(4) if head_bias else None
+
+    assert activation_triton.sigmoid_mul(x, gate, bias, enable_pdl=enable_pdl) is x
+    assert activation.sigmoid_mul(x, gate, head_bias=bias, enable_pdl=enable_pdl) is x
+
+    direct, through_op = launches
+    assert through_op == direct
+    assert through_op[2]["ENABLE_PDL"] is enable_pdl
+    assert through_op[1][3] is bias
 
 
 @pytest.mark.parametrize(

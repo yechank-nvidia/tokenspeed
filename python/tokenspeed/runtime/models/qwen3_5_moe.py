@@ -33,8 +33,8 @@ from tokenspeed_kernel.ops.activation.triton import (
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.quantization import quantize_nvfp4
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -238,7 +238,12 @@ class Qwen3_5MoeMLP(nn.Module):
             return x
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
             x_fc1_fp4, x_fc1_scale = (
-                fp4_quantize(x, self.gate_up_proj.input_scale_inv)
+                quantize_nvfp4(
+                    x,
+                    scale_layout="swizzled",
+                    enable_pdl=pdl_enabled(),
+                    inverse_scale=self.gate_up_proj.input_scale_inv,
+                )
                 if x_nvfp4 is None
                 else x_nvfp4
             )

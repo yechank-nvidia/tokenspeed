@@ -62,12 +62,12 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
     rmsnorm_gated_sigmoid,
-    sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention.mla import (
     mla_normalize_project_query,
@@ -90,7 +90,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.quantization import quantize_nvfp4
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
@@ -762,7 +762,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if gate is not None and not fuse_value_gate:
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
-            attn_output = sigmoid_mul(attn_output, gate)
+            attn_output = sigmoid_mul(attn_output, gate, enable_pdl=pdl_enabled())
         if projection_out is not None:
             # K3AttnComm supplies this only for the unbiased BF16 TP shard.
             return mm(attn_output, self.o_proj.weight, bias=None, out=projection_out)
@@ -2607,11 +2607,11 @@ class KimiLinearMoE(nn.Module):
 
             if self.experts.plan["weight_dtype"] == "nvfp4":
                 if num_tokens > 0:
-                    routed_input = fp4_quantize(
+                    routed_input = quantize_nvfp4(
                         routed_input,
-                        self.experts.w13_input_scale_quant,
-                        is_sf_swizzled_layout=False,
+                        scale_layout="linear",
                         enable_pdl=pdl_enabled(),
+                        inverse_scale=self.experts.w13_input_scale_quant,
                     )
                 else:
                     routed_input = (

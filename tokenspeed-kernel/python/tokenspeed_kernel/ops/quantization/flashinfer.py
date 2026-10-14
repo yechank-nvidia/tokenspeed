@@ -106,6 +106,7 @@ if platform.is_nvidia and platform.is_blackwell:
         "quantization",
         "nvfp4",
         name="flashinfer_quantize_nvfp4",
+        features={"inverse_scale"},
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -122,10 +123,13 @@ if platform.is_nvidia and platform.is_blackwell:
         scale: float | torch.Tensor | None = None,
         scale_layout: str = "swizzled",
         enable_pdl: bool | None = None,
+        *,
+        inverse_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The public quantization API uses the actual scale; FlashInfer's FP4
-        # helper expects the inverse scale used before packing.
-        scale_inv = 1.0 / scale
+        # helper expects the inverse scale used before packing. A caller that
+        # holds the inverse passes it as inverse_scale, used as given.
+        scale_inv = 1.0 / scale if inverse_scale is None else inverse_scale
         return fp4_quantize(
             x,
             global_scale=scale_inv,

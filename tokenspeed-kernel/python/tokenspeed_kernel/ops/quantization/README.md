@@ -16,3 +16,10 @@ and block quantization reject `enable_pdl=True`, which their kernels do not
 support. The common GEMM API predicts online activation scale storage from
 the weight scale encoding: uint8 UE8M0 weights use uint8 activation scales;
 FP32 weights use FP32 activation scales.
+
+# NVFP4 quantization
+
+`quantize_nvfp4` takes the actual input scale (`scale`). A caller that
+already holds its reciprocal, for example computed once at weight loading,
+passes `inverse_scale` instead. The `inverse_scale` feature selects a kernel
+that uses it as given, so no division runs per call.

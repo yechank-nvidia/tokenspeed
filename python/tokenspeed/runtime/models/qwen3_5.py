@@ -27,7 +27,8 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation import sigmoid_mul
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -914,7 +915,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Attention with the optional output gate; draft subclasses override."""
         attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
         if gate is not None:
-            sigmoid_mul(attn_output, gate)
+            sigmoid_mul(attn_output, gate, enable_pdl=pdl_enabled())
         return attn_output
 
     def self_attention(

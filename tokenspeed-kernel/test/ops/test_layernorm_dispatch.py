@@ -28,6 +28,8 @@ import pytest
 import tokenspeed_kernel.ops.layernorm as layernorm
 import tokenspeed_kernel.ops.layernorm.triton as triton_layernorm
 import torch
+from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.registry import KernelRegistry
 
 
 def _platform(vendor: str) -> SimpleNamespace:
@@ -248,3 +250,55 @@ def test_ascend_forms_the_offset_weight_in_the_weight_dtype(monkeypatch):
     # A zero offset hands the stored weights through untouched.
     ascend.qk_rmsnorm(q, k, q_weight, k_weight, 1e-5, weight_offset=0.0)
     assert calls[1][2] is q_weight and calls[1][3] is k_weight
+
+
+def _launch_roles(launch, inputs):
+    """A recorded launch with each tensor named by the input whose storage it
+    views, or by its shape and dtype when it is new."""
+
+    def role(value):
+        if not isinstance(value, torch.Tensor):
+            return value
+        for name, tensor in inputs.items():
+            if value.data_ptr() == tensor.data_ptr():
+                return name
+        return ("new", tuple(value.shape), value.dtype)
+
+    args, kwargs = launch
+    return [role(arg) for arg in args], {k: role(v) for k, v in kwargs.items()}
+
+
+@pytest.mark.parametrize("platform_fixture", ["b200_platform", "mi350_platform"])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("with_out", [False, True])
+def test_plain_rmsnorm_launches_the_triton_rmsnorm_as_a_direct_call(
+    monkeypatch, request, platform_fixture, enable_pdl, with_out
+) -> None:
+    """plain_rmsnorm selects the Triton RMSNorm and launches it exactly as a
+    direct call without a residual does, with the caller's enable_pdl."""
+    kernel = _KernelLaunches()
+    monkeypatch.setattr(triton_layernorm, "_rmsnorm_kernel", kernel)
+    x = torch.zeros(3, 96, dtype=torch.bfloat16)
+    weight = torch.ones(96, dtype=torch.bfloat16)
+    out = torch.empty_like(x) if with_out else None
+    host = Platform.get()
+    Platform.override(request.getfixturevalue(platform_fixture))
+    KernelRegistry.get().clear_cache()
+    try:
+        direct = triton_layernorm.rmsnorm(
+            x, weight, 1e-6, out=out, enable_pdl=enable_pdl
+        )
+        through_op = layernorm.plain_rmsnorm(
+            x, weight, 1e-6, out=out, enable_pdl=enable_pdl
+        )
+    finally:
+        Platform.override(host)
+        KernelRegistry.get().clear_cache()
+
+    assert through_op.shape == direct.shape == x.shape
+    assert (through_op is out) == with_out
+    inputs = {"x": x, "weight": weight} | ({"out": out} if with_out else {})
+    direct_launch, op_launch = kernel.launches
+    assert _launch_roles(op_launch, inputs) == _launch_roles(direct_launch, inputs)
+    assert op_launch[1]["HAS_RESIDUAL"] is False
+    assert op_launch[1]["ENABLE_PDL"] is enable_pdl

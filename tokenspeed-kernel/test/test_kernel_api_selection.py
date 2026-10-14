@@ -42,6 +42,7 @@ from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
+import tokenspeed_kernel.ops.activation.triton as _activation_triton
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
@@ -84,6 +85,7 @@ import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
+import tokenspeed_kernel.ops.layernorm.triton as _layernorm_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_ep as _moe_deep_ep
@@ -110,6 +112,7 @@ import tokenspeed_kernel.ops.transform as _transform_pkg
 import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
 import tokenspeed_kernel.ops.transform.triton as _transform_triton
 import torch
+from tokenspeed_kernel.ops.activation import sigmoid_mul as kernel_sigmoid_mul
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
 from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
@@ -119,12 +122,14 @@ from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel
 from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32 as kernel_dsv4_linear_fp32
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.layernorm import plain_rmsnorm as kernel_plain_rmsnorm
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe import moe_topk as kernel_moe_topk
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.quantization import quantize_nvfp4 as kernel_quantize_nvfp4
 from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
 from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
@@ -210,6 +215,9 @@ _RELOAD_MODULES = [
     _moe_native,
     _moe_triton,
     _moe_pkg,
+    # Activation and layernorm registration modules.
+    _activation_triton,
+    _layernorm_triton,
     # Quantization registration modules.
     _quantization_flashinfer,
     _quantization_triton,
@@ -489,6 +497,25 @@ def _quantize_fp8() -> torch.Tensor:
         dequantize=True,
     )
     return output
+
+
+def _quantize_nvfp4_inverse_scale() -> tuple[torch.Tensor, torch.Tensor]:
+    x = torch.empty((4, 128), dtype=torch.bfloat16)
+    inverse_scale = torch.ones((1,), dtype=torch.float32)
+    return kernel_quantize_nvfp4(x, scale_layout="linear", inverse_scale=inverse_scale)
+
+
+def _plain_rmsnorm() -> torch.Tensor:
+    x = torch.empty((4, 128), dtype=torch.bfloat16)
+    weight = torch.empty((128,), dtype=torch.bfloat16)
+    return kernel_plain_rmsnorm(x, weight, 1e-6, enable_pdl=False)
+
+
+def _sigmoid_mul(*, head_bias: bool) -> torch.Tensor:
+    x = torch.empty((4, 256), dtype=torch.bfloat16)
+    gate = torch.empty((4, 2, 128), dtype=torch.bfloat16)
+    bias = torch.empty((2,), dtype=torch.float32) if head_bias else None
+    return kernel_sigmoid_mul(x, gate, head_bias=bias, enable_pdl=False)
 
 
 def _mm_dense() -> torch.Tensor:
@@ -6171,6 +6198,41 @@ _CASES = [
         "mxfp8",
         "flashinfer_quantize_mxfp8",
         _quantize_mxfp8,
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "quantization",
+        "nvfp4",
+        "flashinfer_quantize_nvfp4",
+        _quantize_nvfp4_inverse_scale,
+        id_suffix="inverse-scale",
+    ),
+    # Activation and layernorm API x architecture golden cases.
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "activation",
+        "sigmoid_mul",
+        "triton_sigmoid_mul",
+        partial(_sigmoid_mul, head_bias=False),
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "activation",
+        "sigmoid_mul",
+        "triton_sigmoid_mul",
+        partial(_sigmoid_mul, head_bias=True),
+        id_suffix="head-bias",
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "layernorm",
+        "plain_rmsnorm",
+        "triton_plain_rmsnorm",
+        _plain_rmsnorm,
     ),
     _case(
         _is_cdna4,

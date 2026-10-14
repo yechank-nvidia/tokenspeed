@@ -45,8 +45,8 @@ from tokenspeed_kernel.ops.gemm.cute_dsl import (
 )
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.quantization import quantize_nvfp4
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -299,9 +299,11 @@ class DeepseekV3MLP(nn.Module):
             return x
 
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = fp4_quantize(
+            x_fc1_fp4, x_fc1_scale = quantize_nvfp4(
                 x,
-                self.gate_up_proj.input_scale_inv,
+                scale_layout="swizzled",
+                enable_pdl=pdl_enabled(),
+                inverse_scale=self.gate_up_proj.input_scale_inv,
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,

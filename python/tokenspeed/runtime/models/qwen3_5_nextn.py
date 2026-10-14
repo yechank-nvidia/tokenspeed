@@ -24,7 +24,8 @@ import logging
 from collections.abc import Iterable
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation import sigmoid_mul
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -90,7 +91,11 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             return super()._attn(positions, q, k, v, gate, ctx)
         attn_output = self.attn.attend_live_rows(q, k, v, positions, ctx)
         if gate is not None:
-            sigmoid_mul(attn_output, gate.index_select(0, ctx.gather_ids))
+            sigmoid_mul(
+                attn_output,
+                gate.index_select(0, ctx.gather_ids),
+                enable_pdl=pdl_enabled(),
+            )
         return attn_output
 
     def _maybe_narrow_residual(

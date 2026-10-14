@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
 
@@ -193,7 +195,11 @@ def _sigmoid_mul_kernel(
 
 
 def sigmoid_mul(
-    x: torch.Tensor, gate: torch.Tensor, head_bias: torch.Tensor | None = None
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    head_bias: torch.Tensor | None = None,
+    *,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """In-place ``x *= sigmoid(gate)``, or ``x *= sigmoid(gate + head_bias)``.
 
@@ -216,6 +222,8 @@ def sigmoid_mul(
     an IEEE-rounded division, rounding once on the store. Without it the
     kernel is unchanged and uses ``tl.sigmoid``.
 
+    ``enable_pdl`` launches with Programmatic Dependent Launch; None follows
+    ``pdl_enabled()``.
     """
     if x.ndim != 2:
         raise ValueError(f"x must be 2D, got {x.ndim}D")
@@ -277,7 +285,7 @@ def sigmoid_mul(
 
     BLOCK_SIZE = 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    enable_pdl = pdl_enabled()
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _sigmoid_mul_kernel[grid](
         x,
@@ -293,6 +301,29 @@ def sigmoid_mul(
         **pdl_kwargs,
     )
     return x
+
+
+@register_kernel(
+    "activation",
+    "sigmoid_mul",
+    name="triton_sigmoid_mul",
+    features={"head_bias"},
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_sigmoid_mul(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    head_bias: torch.Tensor | None,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """``sigmoid_mul``: one launch of ``_sigmoid_mul_kernel``."""
+    return sigmoid_mul(x, gate, head_bias, enable_pdl=enable_pdl)
 
 
 @triton.jit
